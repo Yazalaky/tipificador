@@ -1,0 +1,146 @@
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.4;
+  font-weight: 400;
+}
+
+body {
+  margin: 0;
+  background: #0b0f19;
+  color: #e8eefc;
+}
+
+a { color: inherit; }
+
+button {
+  cursor: pointer;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 18px;
+}
+
+.card {
+  background: #121a2b;
+  border: 1px solid #22304a;
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.badge {
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid #2b3b5a;
+  background: #0f172a;
+  font-size: 12px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  gap: 14px;
+}
+
+.thumbGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.thumb {
+  border: 2px solid transparent;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #0f172a;
+  position: relative;
+}
+
+.thumb.selected {
+  border-color: #7aa2ff;
+}
+
+.thumb img {
+  width: 100%;
+  display: block;
+}
+
+.thumbLabel {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(10, 14, 26, 0.8);
+  border: 1px solid rgba(255,255,255,0.08);
+}
+
+.toolbar button {
+  border: 1px solid #2b3b5a;
+  background: #0f172a;
+  color: #e8eefc;
+  padding: 10px 12px;
+  border-radius: 10px;
+}
+
+.toolbar button.primary {
+  background: #1f3b8a;
+  border-color: #3153b5;
+}
+
+.toolbar button.danger {
+  background: #7a1f2b;
+  border-color: #b53143;
+}
+
+.toolbar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+input[type="text"] {
+  background: #0f172a;
+  border: 1px solid #2b3b5a;
+  color: #e8eefc;
+  padding: 10px 12px;
+  border-radius: 10px;
+  outline: none;
+}
+
+.small {
+  font-size: 12px;
+  opacity: 0.9;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid #22304a;
+  margin: 12px 0;
+}
+
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+
+.modal {
+  width: min(520px, 100%);
+  background: #121a2b;
+  border: 1px solid #22304a;
+  border-radius: 14px;
+  padding: 14px;
+}
+
