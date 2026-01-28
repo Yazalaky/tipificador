@@ -34,6 +34,7 @@ export default function App() {
   const [nitOverride, setNitOverride] = useState("");
   const [ocfeOverride, setOcfeOverride] = useState("");
   const [processing, setProcessing] = useState(false);
+  const [thumbErrors, setThumbErrors] = useState<Set<number>>(new Set());
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { SIN: 0 };
@@ -56,6 +57,10 @@ export default function App() {
     setCls({});
     setSelected(new Set());
     setPreviewPage(null);
+    setNeedOverride(null);
+    setNitOverride("");
+    setOcfeOverride("");
+    setThumbErrors(new Set());
 
     const form = new FormData();
     for (const f of Array.from(files)) {
@@ -174,10 +179,13 @@ export default function App() {
 
     // download zip
     const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition") || "";
+    const filenameMatch = cd.match(/filename="?([^"]+)"?/i);
+    const filename = filenameMatch?.[1] || "TIPIFICADO.zip";
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "TIPIFICADO.zip";
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -188,115 +196,156 @@ export default function App() {
     // setJobId(null);
   }
 
+  const typedCount = totalPages - counts.SIN;
+  const progress = totalPages > 0 ? Math.round((typedCount / totalPages) * 100) : 0;
+
+  const fileButtonClass = uploading ? "fileButton fileButton--disabled" : "fileButton";
+
   return (
-    <div className="container">
-      <h2>Tipificador Cloud (MVP)</h2>
-      <div className="card">
-        <div className="row">
-          <input
-            type="file"
-            multiple
-            accept="application/pdf"
-            onChange={(e) => onUpload(e.target.files)}
-            disabled={uploading}
-          />
-          <span className="badge">
-            API: {API_BASE.replace("http://", "").replace("https://", "")}
-          </span>
-          {uploading && <span className="badge">Subiendo…</span>}
-          {jobId && <span className="badge">Job: {jobId}</span>}
-          {totalPages > 0 && <span className="badge">Páginas: {totalPages}</span>}
+    <div className="app">
+      <header className="topAppBar">
+        <div>
+          <div className="title">Tipificador Cloud</div>
+          <div className="subtitle">Clasifica páginas y genera ZIP por categoría</div>
         </div>
-
-        <hr />
-
         <div className="row">
-          <span className="badge">SIN TIPIFICAR: {counts.SIN}</span>
-          {CATEGORIES.map((c) => (
-            <span key={c} className="badge">
-              {c}: {counts[c]}
-            </span>
-          ))}
+          <span className="chip">API: {API_BASE.replace(/^https?:\/\//, "")}</span>
+          {uploading && <span className="chip chip--info">Subiendo…</span>}
+          {jobId && <span className="chip chip--muted">Job: {jobId}</span>}
+          {totalPages > 0 && <span className="chip">Páginas: {totalPages}</span>}
         </div>
+      </header>
 
-        <p className="small">
-          Selección: click (única), Ctrl (multi), Shift (rango). Luego asigna CRC/FEV/HEV/OPF/PDE.
-          <br />
-          Requisito: FEV obligatorio para detectar NIT+OCFE y generar nombres.
-        </p>
-      </div>
+      <main className="content">
+        <section className="card">
+          <div className="row">
+            <label className={fileButtonClass}>
+              <input
+                type="file"
+                multiple
+                accept="application/pdf"
+                onChange={(e) => onUpload(e.target.files)}
+                disabled={uploading}
+              />
+              Cargar PDFs
+            </label>
+            <span className="chip chip--muted">Selección: click, Ctrl, Shift</span>
+            <span className="chip chip--muted">FEV obligatorio</span>
+          </div>
 
-      {jobId && totalPages > 0 && (
-        <div className="grid" style={{ marginTop: 14 }}>
-          <div className="card">
-            <div className="toolbar row">
-              {CATEGORIES.map((c) => (
-                <button key={c} onClick={() => assignCategory(c)} disabled={selected.size === 0}>
-                  {c}
-                </button>
-              ))}
-              <button className="danger" onClick={clearCategory} disabled={selected.size === 0}>
-                Limpiar
-              </button>
-              <button
-                className="primary"
-                onClick={() => processJob(false)}
-                disabled={!hasFEV || processing}
-                title={!hasFEV ? "FEV es obligatorio" : "Procesar y descargar ZIP"}
-              >
-                {processing ? "Procesando…" : "Procesar"}
-              </button>
-            </div>
+          <div className="progressBar" aria-label="progreso">
+            <div className="progressFill" style={{ width: `${progress}%` }} />
+          </div>
+          <div className="row">
+            <span className="chip">Tipificadas: {typedCount}</span>
+            <span className="chip">Sin tipificar: {counts.SIN}</span>
+            <span className="chip">Seleccionadas: {selected.size}</span>
+          </div>
 
-            <hr />
+          <div className="row">
+            {CATEGORIES.map((c) => (
+              <span key={c} className={`chip chip--cat chip--${c.toLowerCase()}`}>
+                {c}: {counts[c]}
+              </span>
+            ))}
+          </div>
+        </section>
 
-            <div className="thumbGrid">
-              {Array.from({ length: totalPages }, (_, i) => {
-                const isSel = selected.has(i);
-                const label = cls[i] ?? "SIN";
-                return (
-                  <div
-                    key={i}
-                    className={`thumb ${isSel ? "selected" : ""}`}
-                    onClick={(e) => toggleSelect(i, e)}
-                    title={`Página ${i}`}
+        {jobId && totalPages > 0 && (
+          <section className="grid">
+            <div className="card">
+              <div className="toolbar row">
+                {CATEGORIES.map((c) => (
+                  <button
+                    key={c}
+                    className="btn btn--tonal"
+                    onClick={() => assignCategory(c)}
+                    disabled={selected.size === 0}
                   >
-                    <img src={`${API_BASE}/jobs/${jobId}/pages/${i}/thumb.png`} alt={`p${i}`} />
-                    <div className="thumbLabel">
-                      #{i} · {label}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+                    {c}
+                  </button>
+                ))}
+                <button className="btn btn--outlined" onClick={clearCategory} disabled={selected.size === 0}>
+                  Limpiar
+                </button>
+                <button
+                  className="btn btn--filled"
+                  onClick={() => processJob(false)}
+                  disabled={!hasFEV || processing}
+                  title={!hasFEV ? "FEV es obligatorio" : "Procesar y descargar ZIP"}
+                >
+                  {processing ? "Procesando…" : "Procesar"}
+                </button>
+              </div>
 
-          <div className="card">
-            <h3>Vista previa</h3>
-            {previewPage === null ? (
-              <p className="small">Haz click en una miniatura para ver la página en grande.</p>
-            ) : (
-              <>
-                <div className="row">
-                  <span className="badge">Página #{previewPage}</span>
-                  <span className="badge">Tipo: {cls[previewPage] ?? "SIN TIPIFICAR"}</span>
+              <div className="thumbGrid">
+                {Array.from({ length: totalPages }, (_, i) => {
+                  const isSel = selected.has(i);
+                  const label = cls[i] ?? "SIN";
+                  const labelClass = label === "SIN" ? "cat-none" : `cat-${label.toLowerCase()}`;
+                  const hasError = thumbErrors.has(i);
+                  const displayIndex = i + 1;
+                  return (
+                    <div
+                      key={i}
+                      className={`thumb ${isSel ? "selected" : ""} ${labelClass}`}
+                      onClick={(e) => toggleSelect(i, e)}
+                      title={`Página ${displayIndex}`}
+                    >
+                      {!hasError ? (
+                        <img
+                          src={`${API_BASE}/jobs/${jobId}/pages/${i}/thumb.png`}
+                          alt={`p${displayIndex}`}
+                          loading="lazy"
+                          onError={() =>
+                            setThumbErrors((prev) => new Set(prev).add(i))
+                          }
+                        />
+                      ) : (
+                        <div className="thumbFallback">Sin vista</div>
+                      )}
+                      <div className="thumbLabel">
+                        <span>#{displayIndex}</span>
+                        <span className="dot">·</span>
+                        <span>{label}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="card">
+              <div className="row">
+                <div className="sectionTitle">Vista previa</div>
+                {previewPage !== null && (
+                  <>
+                    <span className="chip">Página #{previewPage + 1}</span>
+                    <span className="chip chip--muted">
+                      Tipo: {cls[previewPage] ?? "SIN TIPIFICAR"}
+                    </span>
+                  </>
+                )}
+              </div>
+              {previewPage === null ? (
+                <p className="small">Haz click en una miniatura para ver la página en grande.</p>
+              ) : (
+                <div className="preview">
+                  <img
+                    src={`${API_BASE}/jobs/${jobId}/pages/${previewPage}/view.png`}
+                    alt={`view${previewPage + 1}`}
+                  />
                 </div>
-                <hr />
-                <img
-                  src={`${API_BASE}/jobs/${jobId}/pages/${previewPage}/view.png`}
-                  alt={`view${previewPage}`}
-                  style={{ width: "100%", borderRadius: 12, border: "1px solid #22304a" }}
-                />
-              </>
-            )}
-          </div>
-        </div>
-      )}
+              )}
+            </div>
+          </section>
+        )}
+      </main>
 
       {needOverride && (
         <div className="modalBackdrop">
           <div className="modal">
-            <h3>No pude detectar NIT/OCFE</h3>
+            <h3>No pude detectar NIT o número de factura</h3>
             <p className="small">{needOverride.message}</p>
             <div className="row" style={{ marginTop: 8 }}>
               <input
@@ -307,7 +356,7 @@ export default function App() {
               />
               <input
                 type="text"
-                placeholder="OCFE (ej: OCFE5871)"
+                placeholder="Factura (ej: OCFE5871 o ECUC1890)"
                 value={ocfeOverride}
                 onChange={(e) => setOcfeOverride(e.target.value)}
               />
@@ -333,4 +382,3 @@ export default function App() {
     </div>
   );
 }
-
