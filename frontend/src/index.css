@@ -112,8 +112,9 @@ select {
 
 .grid {
   display: grid;
-  grid-template-columns: 360px 1fr;
+  grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
   gap: 16px;
+  align-items: start;
 }
 
 .chip {
@@ -190,6 +191,12 @@ select {
   margin: 12px 0 8px;
 }
 
+.statsGroup {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+}
+
 .progressFill {
   height: 100%;
   background: linear-gradient(90deg, #0f6b63, #0f8a7b);
@@ -198,6 +205,18 @@ select {
 
 .toolbar {
   margin-bottom: 12px;
+}
+
+.thumbPane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.thumbScroller {
+  overflow-y: auto;
+  max-height: calc(100vh - 250px);
+  padding-right: 6px;
 }
 
 .btn {
@@ -292,6 +311,13 @@ select {
   font-weight: 600;
 }
 
+.previewCard {
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 150px);
+  overflow-y: auto;
+}
+
 .preview {
   margin-top: 12px;
   border-radius: 16px;
@@ -301,7 +327,8 @@ select {
 }
 
 .preview img {
-  width: 100%;
+  width: min(100%, 900px);
+  margin: 0 auto;
   display: block;
 }
 
@@ -346,5 +373,12 @@ input[type="text"] {
 
   .grid {
     grid-template-columns: 1fr;
+  }
+
+  .thumbScroller,
+  .previewCard {
+    max-height: none;
+    position: static;
+    overflow: visible;
   }
 }

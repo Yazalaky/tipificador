@@ -6,6 +6,8 @@ import time
 import unicodedata
 import shutil
 import zipfile
+import subprocess
+import concurrent.futures
 from io import BytesIO
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -32,6 +34,12 @@ MAX_FILE_BYTES = int(os.environ.get("TIPIFICADOR_MAX_FILE_BYTES", "104857600")) 
 MAX_FILES = int(os.environ.get("TIPIFICADOR_MAX_FILES", "20"))
 JOB_TTL_SECONDS = int(os.environ.get("TIPIFICADOR_JOB_TTL_SECONDS", "21600"))  # 6 hours
 CACHE_VIEW = os.environ.get("TIPIFICADOR_CACHE_VIEW", "1").lower() not in {"0", "false", "no"}
+OCR_ENABLED = os.environ.get("TIPIFICADOR_OCR_ENABLED", "1").lower() not in {"0", "false", "no"}
+OCR_LANG = os.environ.get("TIPIFICADOR_OCR_LANG", "spa+eng")
+OCR_DPI = int(os.environ.get("TIPIFICADOR_OCR_DPI", "300"))
+OCR_PSM = os.environ.get("TIPIFICADOR_OCR_PSM", "4")
+OCR_KEEP_IMAGES = os.environ.get("TIPIFICADOR_OCR_KEEP_IMAGES", "0").lower() in {"1", "true", "yes"}
+OCR_WORKERS = int(os.environ.get("TIPIFICADOR_OCR_WORKERS", "4"))
 
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$", re.IGNORECASE)
 _NIT_RE = re.compile(
@@ -43,6 +51,33 @@ _INVOICE_RE = re.compile(r"\b([A-Z]{3,6})\s*(\d{3,})\b")
 _INVOICE_HINTS = ("FACTURA", "ELECTR", "VENTA", "N°", "NO.", "NRO")
 _FEV_HINTS = ("FACTURA ELECTRONICA DE VENTA", "FACTURA ELECTRÓNICA DE VENTA")
 _NC_HINTS = ("NOTA DE CREDITO ELECTRONICA", "NOTA DE CRÉDITO ELECTRONICA")
+_AUTO_RULES_STRONG: List[Tuple[str, Tuple[str, ...]]] = [
+    ("PDE", ("AUTORIZACION SERVICIOS", "AUTORIZACION SERVICIOS ")),
+    ("OPF", ("ORDEN MEDICA", "ORDEN MÉDICA")),
+    (
+        "CRC",
+        (
+            "REGISTRO DE ATENCION DOMICILIARIA",
+            "REGISTRO DE ATENCIÓN DOMICILIARIA",
+        ),
+    ),
+    (
+        "HEV",
+        (
+            "CERTIFICACION PRESTACION DE SERVICIOS",
+            "CERTIFICACION PRESTACION DE SERVICIOS POR CONCEPTO",
+            "CERTIFICACION DETALLE DE CARGOS",
+        ),
+    ),
+    (
+        "HEV",
+        (
+            "REGISTRO DE ACTIVIDADES DE CUIDADO",
+            "REGISTRO DE ACTIVIDADES DE CUIDADOR",
+        ),
+    ),
+    ("FEV", ("FACTURA ELECTRONICA DE VENTA", "NOTA DE CREDITO ELECTRONICA", "NOTA DE CRÉDITO ELECTRONICA", "DETALLE DE CARGOS", "FACTURA OCFE")),
+]
 
 
 # ----------------------------
@@ -186,6 +221,84 @@ def _page_kind(text: str) -> str:
     if any(h in upper for h in _NC_HINTS):
         return "nc"
     return "other"
+
+
+def _normalize_ocr_text(text: str) -> str:
+    return _strip_accents(text or "").upper()
+
+
+def _has_crc_table_hint(text: str) -> bool:
+    if not text:
+        return False
+    t = _normalize_ocr_text(text)
+    if "SERVICIO" not in t or "PRESTADOR" not in t:
+        return False
+    if not ("TUTOR" in t or "TUTOR/PACIENTE" in t or "FIRMA" in t):
+        return False
+    if not ("N." in t or "N°" in t or "NO." in t or "NRO" in t):
+        return False
+    if "ATENCION CUIDADOR" not in t and "CUIDADOR" not in t:
+        return False
+    return True
+
+
+def _classify_text(text: str, allow_crc_table: bool = False) -> Optional[str]:
+    if not text:
+        return None
+    t = _normalize_ocr_text(text)
+    for cat, patterns in _AUTO_RULES_STRONG:
+        for p in patterns:
+            if p in t:
+                return cat
+    if allow_crc_table and _has_crc_table_hint(t):
+        return "CRC"
+    return None
+
+
+def _ocr_page_text(job_id: str, page_index: int) -> str:
+    if not OCR_ENABLED:
+        return ""
+    cache_txt = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}.txt")
+    if os.path.exists(cache_txt):
+        with open(cache_txt, "r", encoding="utf-8") as f:
+            return f.read()
+
+    meta = _load_meta(job_id)
+    pdf_idx, src_page = meta["page_map"][page_index]
+    doc = _open_source_pdf(job_id, pdf_idx)
+    try:
+        page = doc.load_page(src_page)
+        zoom = OCR_DPI / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        img_path = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}.png")
+        pix.save(img_path)
+    finally:
+        doc.close()
+
+    out_base = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}")
+    cmd = ["tesseract", img_path, out_base, "-l", OCR_LANG, "--psm", str(OCR_PSM)]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0 and OCR_LANG != "eng":
+        cmd = ["tesseract", img_path, out_base, "-l", "eng", "--psm", str(OCR_PSM)]
+        subprocess.run(cmd, capture_output=True, text=True)
+
+    text = ""
+    if os.path.exists(cache_txt):
+        with open(cache_txt, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+
+    if not OCR_KEEP_IMAGES and os.path.exists(img_path):
+        try:
+            os.remove(img_path)
+        except OSError:
+            pass
+
+    return text
+
+
+def _ocr_cache_paths(job_id: str, page_index: int) -> Tuple[str, str]:
+    base = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}")
+    return f"{base}.txt", f"{base}.png"
 
 
 def _extract_nit_invoice_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -346,6 +459,11 @@ class ProcessRequest(BaseModel):
     keepJob: bool = False
 
 
+class AutoClassifyResponse(BaseModel):
+    classifications: Dict[str, Optional[Category]]
+    ocrEnabled: bool
+
+
 # ----------------------------
 # FastAPI app
 # ----------------------------
@@ -463,6 +581,87 @@ def get_view(job_id: str, page_index: int):
         with open(cache_path, "wb") as f:
             f.write(img)
     return Response(content=img, media_type="image/png")
+
+
+@app.get("/jobs/{job_id}/pages/{page_index}/ocr.txt")
+def get_ocr_text(job_id: str, page_index: int, refresh: bool = False):
+    meta = _load_meta(job_id)
+    total = meta["totalPages"]
+    if page_index < 0 or page_index >= total:
+        raise HTTPException(status_code=404, detail="Página fuera de rango.")
+    if not OCR_ENABLED:
+        raise HTTPException(status_code=503, detail="OCR deshabilitado en el servidor.")
+    if refresh:
+        txt_path, img_path = _ocr_cache_paths(job_id, page_index)
+        for path in (txt_path, img_path):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    text = _ocr_page_text(job_id, page_index)
+    return Response(content=text or "", media_type="text/plain; charset=utf-8")
+
+
+@app.post("/jobs/{job_id}/auto-classify", response_model=AutoClassifyResponse)
+def auto_classify(job_id: str):
+    meta = _load_meta(job_id)
+    total = meta["totalPages"]
+    classifications: Dict[str, Optional[Category]] = {}
+
+    if not OCR_ENABLED:
+        raise HTTPException(status_code=503, detail="OCR deshabilitado en el servidor.")
+
+    def _ocr_for_index(idx: int) -> Tuple[int, str]:
+        return idx, _ocr_page_text(job_id, idx)
+
+    texts: Dict[int, str] = {}
+    if OCR_WORKERS > 1 and total > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=OCR_WORKERS) as executor:
+            for idx, text in executor.map(_ocr_for_index, range(total)):
+                texts[idx] = text
+    else:
+        for i in range(total):
+            texts[i] = _ocr_page_text(job_id, i)
+
+    # Primera pasada: solo reglas fuertes (sin estructura de tabla)
+    strong: Dict[int, Optional[str]] = {}
+    for i in range(total):
+        strong[i] = _classify_text(texts.get(i, ""), allow_crc_table=False)
+
+    # Determinar en qué PDFs hay encabezado CRC real
+    page_map: List[List[int]] = meta["page_map"]
+    per_pdf: Dict[int, List[int]] = {}
+    for g, pair in enumerate(page_map):
+        pdf_idx = pair[0]
+        per_pdf.setdefault(pdf_idx, []).append(g)
+
+    crc_pdf: Dict[int, bool] = {}
+    for pdf_idx, pages in per_pdf.items():
+        crc_pdf[pdf_idx] = any(strong.get(p) == "CRC" for p in pages)
+
+    # Segunda pasada: permitir tabla CRC solo si el PDF tiene encabezado CRC
+    for i in range(total):
+        pdf_idx = page_map[i][0]
+        if strong.get(i):
+            classifications[str(i)] = strong[i]
+        else:
+            allow_crc = crc_pdf.get(pdf_idx, False)
+            classifications[str(i)] = _classify_text(texts.get(i, ""), allow_crc_table=allow_crc) or "HEV"
+
+    # Propagar clasificación dentro del mismo PDF fuente si existe un encabezado fuerte unico
+    for pdf_idx, pages in per_pdf.items():
+        strong_hits = set()
+        for p in pages:
+            cat = classifications[str(p)]
+            if cat in {"FEV", "CRC", "OPF", "PDE"}:
+                strong_hits.add(cat)
+        if len(strong_hits) == 1:
+            chosen = next(iter(strong_hits))
+            for p in pages:
+                classifications[str(p)] = chosen
+
+    return AutoClassifyResponse(classifications=classifications, ocrEnabled=OCR_ENABLED)
 
 
 @app.post("/jobs/{job_id}/process")

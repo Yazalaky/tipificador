@@ -21,6 +21,7 @@ export default function App() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [totalPages, setTotalPages] = useState<number>(0);
   const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // classifications: pageIndex -> Category | null
   const [cls, setCls] = useState<Record<number, Category | null>>({});
@@ -35,6 +36,7 @@ export default function App() {
   const [ocfeOverride, setOcfeOverride] = useState("");
   const [processing, setProcessing] = useState(false);
   const [thumbErrors, setThumbErrors] = useState<Set<number>>(new Set());
+  const [autoClassifying, setAutoClassifying] = useState(false);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { SIN: 0 };
@@ -48,6 +50,22 @@ export default function App() {
   }, [cls, totalPages]);
 
   const hasFEV = counts["FEV"] > 0;
+
+  function resetUI() {
+    setJobId(null);
+    setTotalPages(0);
+    setCls({});
+    setSelected(new Set());
+    setPreviewPage(null);
+    setNeedOverride(null);
+    setNitOverride("");
+    setOcfeOverride("");
+    setThumbErrors(new Set());
+    lastClicked.current = null;
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
 
   async function onUpload(files: FileList | null) {
     if (!files || files.length === 0) return;
@@ -192,8 +210,35 @@ export default function App() {
     window.URL.revokeObjectURL(url);
 
     setProcessing(false);
-    // job is deleted server-side after process; reset UI optionally
-    // setJobId(null);
+    // job is deleted server-side after process; reset UI to start a new batch
+    resetUI();
+  }
+
+  async function autoClassify() {
+    if (!jobId) return;
+    setAutoClassifying(true);
+    try {
+      const res = await fetch(`${API_BASE}/jobs/${jobId}/auto-classify`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        alert(`Error auto-tipificando: ${t}`);
+        setAutoClassifying(false);
+        return;
+      }
+      const data = await res.json();
+      const next: Record<number, Category | null> = {};
+      Object.entries(data.classifications || {}).forEach(([k, v]) => {
+        const idx = Number(k);
+        if (Number.isFinite(idx)) {
+          next[idx] = (v as Category) ?? null;
+        }
+      });
+      setCls(next);
+    } finally {
+      setAutoClassifying(false);
+    }
   }
 
   const typedCount = totalPages - counts.SIN;
@@ -226,6 +271,7 @@ export default function App() {
                 accept="application/pdf"
                 onChange={(e) => onUpload(e.target.files)}
                 disabled={uploading}
+                ref={fileInputRef}
               />
               Cargar PDFs
             </label>
@@ -236,24 +282,26 @@ export default function App() {
           <div className="progressBar" aria-label="progreso">
             <div className="progressFill" style={{ width: `${progress}%` }} />
           </div>
-          <div className="row">
-            <span className="chip">Tipificadas: {typedCount}</span>
-            <span className="chip">Sin tipificar: {counts.SIN}</span>
-            <span className="chip">Seleccionadas: {selected.size}</span>
-          </div>
+          <div className="statsGroup">
+            <div className="row">
+              <span className="chip">Tipificadas: {typedCount}</span>
+              <span className="chip">Sin tipificar: {counts.SIN}</span>
+              <span className="chip">Seleccionadas: {selected.size}</span>
+            </div>
 
-          <div className="row">
-            {CATEGORIES.map((c) => (
-              <span key={c} className={`chip chip--cat chip--${c.toLowerCase()}`}>
-                {c}: {counts[c]}
-              </span>
-            ))}
+            <div className="row">
+              {CATEGORIES.map((c) => (
+                <span key={c} className={`chip chip--cat chip--${c.toLowerCase()}`}>
+                  {c}: {counts[c]}
+                </span>
+              ))}
+            </div>
           </div>
         </section>
 
         {jobId && totalPages > 0 && (
           <section className="grid">
-            <div className="card">
+            <div className="card thumbPane">
               <div className="toolbar row">
                 {CATEGORIES.map((c) => (
                   <button
@@ -269,6 +317,14 @@ export default function App() {
                   Limpiar
                 </button>
                 <button
+                  className="btn btn--tonal"
+                  onClick={autoClassify}
+                  disabled={!jobId || autoClassifying}
+                  title="Clasificar automáticamente usando OCR"
+                >
+                  {autoClassifying ? "Auto‑tipificando…" : "Auto‑tipificar"}
+                </button>
+                <button
                   className="btn btn--filled"
                   onClick={() => processJob(false)}
                   disabled={!hasFEV || processing}
@@ -278,44 +334,46 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="thumbGrid">
-                {Array.from({ length: totalPages }, (_, i) => {
-                  const isSel = selected.has(i);
-                  const label = cls[i] ?? "SIN";
-                  const labelClass = label === "SIN" ? "cat-none" : `cat-${label.toLowerCase()}`;
-                  const hasError = thumbErrors.has(i);
-                  const displayIndex = i + 1;
-                  return (
-                    <div
-                      key={i}
-                      className={`thumb ${isSel ? "selected" : ""} ${labelClass}`}
-                      onClick={(e) => toggleSelect(i, e)}
-                      title={`Página ${displayIndex}`}
-                    >
-                      {!hasError ? (
-                        <img
-                          src={`${API_BASE}/jobs/${jobId}/pages/${i}/thumb.png`}
-                          alt={`p${displayIndex}`}
-                          loading="lazy"
-                          onError={() =>
-                            setThumbErrors((prev) => new Set(prev).add(i))
-                          }
-                        />
-                      ) : (
-                        <div className="thumbFallback">Sin vista</div>
-                      )}
-                      <div className="thumbLabel">
-                        <span>#{displayIndex}</span>
-                        <span className="dot">·</span>
-                        <span>{label}</span>
+              <div className="thumbScroller">
+                <div className="thumbGrid">
+                  {Array.from({ length: totalPages }, (_, i) => {
+                    const isSel = selected.has(i);
+                    const label = cls[i] ?? "SIN";
+                    const labelClass = label === "SIN" ? "cat-none" : `cat-${label.toLowerCase()}`;
+                    const hasError = thumbErrors.has(i);
+                    const displayIndex = i + 1;
+                    return (
+                      <div
+                        key={i}
+                        className={`thumb ${isSel ? "selected" : ""} ${labelClass}`}
+                        onClick={(e) => toggleSelect(i, e)}
+                        title={`Página ${displayIndex}`}
+                      >
+                        {!hasError ? (
+                          <img
+                            src={`${API_BASE}/jobs/${jobId}/pages/${i}/thumb.png`}
+                            alt={`p${displayIndex}`}
+                            loading="lazy"
+                            onError={() =>
+                              setThumbErrors((prev) => new Set(prev).add(i))
+                            }
+                          />
+                        ) : (
+                          <div className="thumbFallback">Sin vista</div>
+                        )}
+                        <div className="thumbLabel">
+                          <span>#{displayIndex}</span>
+                          <span className="dot">·</span>
+                          <span>{label}</span>
+                        </div>
                       </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })}
+                </div>
               </div>
             </div>
 
-            <div className="card">
+            <div className="card previewCard">
               <div className="row">
                 <div className="sectionTitle">Vista previa</div>
                 {previewPage !== null && (
