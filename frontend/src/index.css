@@ -67,8 +67,9 @@ select {
 }
 
 .topAppBar {
+  position: relative;
   display: flex;
-  justify-content: space-between;
+  justify-content: center;
   align-items: center;
   gap: 16px;
   padding: 18px 20px;
@@ -78,21 +79,80 @@ select {
   border: 1px solid rgba(0, 0, 0, 0.04);
 }
 
-.title {
-  font-size: 24px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
+.titleWrap {
+  flex: 1;
+  text-align: center;
 }
 
-.subtitle {
-  color: var(--md-sys-color-on-surface-variant);
-  font-size: 13px;
+.title {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--md-sys-color-on-surface);
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+.headerMeta {
+  position: absolute;
+  right: 22px;
+  top: 52px;
 }
 
 .content {
   display: grid;
   gap: 16px;
   margin-top: 18px;
+}
+
+.centerStage {
+  min-height: 360px;
+  display: grid;
+  place-items: center;
+  gap: 18px;
+  text-align: center;
+}
+
+.stageTitle {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.serviceGrid {
+  width: min(900px, 100%);
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 18px;
+}
+
+.serviceCard {
+  border-radius: 16px;
+  padding: 18px 16px;
+  border: none;
+  background: #5f93c7;
+  color: #ffffff;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  box-shadow: 0 8px 16px rgba(15, 23, 42, 0.12);
+  transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+}
+
+.serviceCard:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.16);
+}
+
+.serviceCard--disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.uploadPanel {
+  display: grid;
+  gap: 14px;
+  justify-items: center;
 }
 
 .card {
@@ -170,6 +230,12 @@ select {
   box-shadow: 0 3px 8px rgba(15, 107, 99, 0.25);
 }
 
+.fileButton--large {
+  padding: 12px 26px;
+  font-size: 16px;
+  border-radius: 999px;
+}
+
 .fileButton input {
   position: absolute;
   inset: 0;
@@ -195,6 +261,18 @@ select {
   display: grid;
   gap: 8px;
   margin-top: 6px;
+}
+
+.statsGroup--center {
+  justify-items: center;
+}
+
+.statsRow {
+  justify-content: center;
+}
+
+.statsCard .row:first-child {
+  justify-content: center;
 }
 
 .progressFill {
@@ -372,6 +450,10 @@ input[type="text"] {
   }
 
   .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .serviceGrid {
     grid-template-columns: 1fr;
   }
 

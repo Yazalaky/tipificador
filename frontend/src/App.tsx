@@ -17,11 +17,23 @@ type DetectError = {
   ocfeDetected?: string | null;
 };
 
+type ServiceId = "cuidador";
+
+const SERVICES: { id: ServiceId | "soon"; label: string; enabled: boolean }[] = [
+  { id: "cuidador", label: "Cuidador", enabled: true },
+  { id: "soon", label: "Próximamente", enabled: false },
+  { id: "soon", label: "Próximamente", enabled: false },
+  { id: "soon", label: "Próximamente", enabled: false },
+  { id: "soon", label: "Próximamente", enabled: false },
+  { id: "soon", label: "Próximamente", enabled: false },
+];
+
 export default function App() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [totalPages, setTotalPages] = useState<number>(0);
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [service, setService] = useState<ServiceId | null>(null);
 
   // classifications: pageIndex -> Category | null
   const [cls, setCls] = useState<Record<number, Category | null>>({});
@@ -50,6 +62,7 @@ export default function App() {
   }, [cls, totalPages]);
 
   const hasFEV = counts["FEV"] > 0;
+  const hasJob = Boolean(jobId && totalPages > 0);
 
   function resetUI() {
     setJobId(null);
@@ -65,6 +78,11 @@ export default function App() {
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
+  }
+
+  function selectService(id: ServiceId) {
+    resetUI();
+    setService(id);
   }
 
   async function onUpload(files: FileList | null) {
@@ -245,61 +263,95 @@ export default function App() {
   const progress = totalPages > 0 ? Math.round((typedCount / totalPages) * 100) : 0;
 
   const fileButtonClass = uploading ? "fileButton fileButton--disabled" : "fileButton";
+  const showHome = !service;
+  const showUpload = Boolean(service) && !hasJob;
+  const showWork = hasJob;
 
   return (
     <div className="app">
       <header className="topAppBar">
-        <div>
+        <div className="titleWrap">
           <div className="title">Tipificador Cloud</div>
-          <div className="subtitle">Clasifica páginas y genera ZIP por categoría</div>
         </div>
-        <div className="row">
-          <span className="chip">API: {API_BASE.replace(/^https?:\/\//, "")}</span>
-          {uploading && <span className="chip chip--info">Subiendo…</span>}
-          {jobId && <span className="chip chip--muted">Job: {jobId}</span>}
-          {totalPages > 0 && <span className="chip">Páginas: {totalPages}</span>}
+        <div className="row headerMeta">
+          {service && <span className="chip chip--muted">Servicio: Cuidador</span>}
+          {showWork && (
+            <>
+              <span className="chip">API: {API_BASE.replace(/^https?:\/\//, "")}</span>
+              {uploading && <span className="chip chip--info">Subiendo…</span>}
+              {jobId && <span className="chip chip--muted">Job: {jobId}</span>}
+              {totalPages > 0 && <span className="chip">Páginas: {totalPages}</span>}
+            </>
+          )}
         </div>
       </header>
 
       <main className="content">
-        <section className="card">
-          <div className="row">
-            <label className={fileButtonClass}>
-              <input
-                type="file"
-                multiple
-                accept="application/pdf"
-                onChange={(e) => onUpload(e.target.files)}
-                disabled={uploading}
-                ref={fileInputRef}
-              />
-              Cargar PDFs
-            </label>
-            <span className="chip chip--muted">Selección: click, Ctrl, Shift</span>
-            <span className="chip chip--muted">FEV obligatorio</span>
-          </div>
-
-          <div className="progressBar" aria-label="progreso">
-            <div className="progressFill" style={{ width: `${progress}%` }} />
-          </div>
-          <div className="statsGroup">
-            <div className="row">
-              <span className="chip">Tipificadas: {typedCount}</span>
-              <span className="chip">Sin tipificar: {counts.SIN}</span>
-              <span className="chip">Seleccionadas: {selected.size}</span>
-            </div>
-
-            <div className="row">
-              {CATEGORIES.map((c) => (
-                <span key={c} className={`chip chip--cat chip--${c.toLowerCase()}`}>
-                  {c}: {counts[c]}
-                </span>
+        {showHome && (
+          <section className="card centerStage">
+            <div className="stageTitle">Selecciona el servicio</div>
+            <div className="serviceGrid">
+              {SERVICES.map((s, idx) => (
+                <button
+                  key={`${s.id}-${idx}`}
+                  className={`serviceCard ${s.enabled ? "" : "serviceCard--disabled"}`}
+                  onClick={() => s.enabled && selectService("cuidador")}
+                  disabled={!s.enabled}
+                >
+                  {s.label}
+                </button>
               ))}
             </div>
-          </div>
-        </section>
+          </section>
+        )}
 
-        {jobId && totalPages > 0 && (
+        {showUpload && (
+          <section className="card centerStage">
+            <div className="stageTitle">Tipificador Cloud</div>
+            <div className="uploadPanel">
+              <label className={`${fileButtonClass} fileButton--large`}>
+                <input
+                  type="file"
+                  multiple
+                  accept="application/pdf"
+                  onChange={(e) => onUpload(e.target.files)}
+                  disabled={uploading}
+                  ref={fileInputRef}
+                />
+                {uploading ? "Subiendo…" : "Cargar PDFs"}
+              </label>
+              <div className="row">
+                <button className="btn btn--outlined" onClick={() => setService(null)}>
+                  Cambiar servicio
+                </button>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {showWork && (
+          <>
+            <section className="card statsCard">
+              <div className="progressBar" aria-label="progreso">
+                <div className="progressFill" style={{ width: `${progress}%` }} />
+              </div>
+              <div className="statsGroup statsGroup--center">
+                <div className="row statsRow">
+                  <span className="chip">Tipificadas: {typedCount}</span>
+                  <span className="chip">Sin tipificar: {counts.SIN}</span>
+                  <span className="chip">Seleccionadas: {selected.size}</span>
+                </div>
+
+                <div className="row statsRow">
+                  {CATEGORIES.map((c) => (
+                    <span key={c} className={`chip chip--cat chip--${c.toLowerCase()}`}>
+                      {c}: {counts[c]}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </section>
+
           <section className="grid">
             <div className="card thumbPane">
               <div className="toolbar row">
@@ -397,6 +449,7 @@ export default function App() {
               )}
             </div>
           </section>
+          </>
         )}
       </main>
 
