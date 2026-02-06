@@ -28,6 +28,24 @@ type BatchPackage = {
   error?: string | null;
 };
 
+function inferBatchStatus(status: string | null | undefined, packages: BatchPackage[]) {
+  if (status && status !== "processing") return status;
+  if (!packages.length) return status ?? null;
+
+  const done = packages.filter((p) => p.status === "done").length;
+  const error = packages.filter((p) => p.status === "error").length;
+  const cancelled = packages.filter((p) => p.status === "cancelled").length;
+  const pending = packages.filter((p) => p.status === "pending").length;
+  const processing = packages.filter((p) => p.status === "processing").length;
+
+  if (cancelled) return "cancelled";
+  if (pending || processing) return status ?? "processing";
+  if (error && done) return "partial";
+  if (error && !done) return "error";
+  if (done) return "done";
+  return status ?? null;
+}
+
 const SERVICES: { id: ServiceId | "soon"; label: string; enabled: boolean }[] = [
   { id: "cuidador", label: "Cuidador", enabled: true },
   { id: "soon", label: "Próximamente", enabled: false },
@@ -65,6 +83,8 @@ export default function App() {
   const [batchStatus, setBatchStatus] = useState<string | null>(null);
   const [batchPackages, setBatchPackages] = useState<BatchPackage[]>([]);
   const [batchRetrying, setBatchRetrying] = useState(false);
+  const [batchNotice, setBatchNotice] = useState<string | null>(null);
+  const [batchActive, setBatchActive] = useState(false);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { SIN: 0 };
@@ -101,6 +121,8 @@ export default function App() {
     setBatchId(null);
     setBatchStatus(null);
     setBatchPackages([]);
+    setBatchNotice(null);
+    setBatchActive(false);
     if (batchInputRef.current) {
       batchInputRef.current.value = "";
     }
@@ -312,19 +334,32 @@ export default function App() {
     const data = await res.json();
     setBatchId(data.batchId);
     setBatchStatus("ready");
+    setBatchActive(false);
     setBatchUploading(false);
     await refreshBatch();
   }
 
   async function refreshBatch() {
     if (!batchId) return null;
-    const res = await fetch(`${API_BASE}/batch/${batchId}`);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const status = data.status || "pending";
-    setBatchStatus(status);
-    setBatchPackages((data.packages || []) as BatchPackage[]);
-    return status;
+    try {
+      const res = await fetch(`${API_BASE}/batch/${batchId}?ts=${Date.now()}`, {
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        return null;
+      }
+      const data = await res.json();
+      const packages = (data.packages || []) as BatchPackage[];
+      const status = inferBatchStatus(data.status || "pending", packages);
+      setBatchStatus(status);
+      setBatchPackages(packages);
+      if (status && ["done", "partial", "error", "cancelled"].includes(status)) {
+        setBatchActive(false);
+      }
+      return status;
+    } catch (err) {
+      return null;
+    }
   }
 
   async function retryBatchErrors() {
@@ -338,6 +373,7 @@ export default function App() {
       return;
     }
     setBatchStatus("processing");
+    setBatchActive(true);
     setBatchRetrying(false);
     await refreshBatch();
   }
@@ -351,6 +387,7 @@ export default function App() {
       return;
     }
     setBatchStatus("processing");
+    setBatchActive(true);
     await refreshBatch();
   }
 
@@ -362,7 +399,13 @@ export default function App() {
       alert(`Error cancelando lote: ${t}`);
       return;
     }
-    await refreshBatch();
+    setBatchStatus("cancelling");
+    setBatchActive(true);
+    const status = await refreshBatch();
+    if (status === "cancelled") {
+      setBatchNotice("Lote cancelado. Vuelve a cargar los archivos.");
+      resetBatchState();
+    }
   }
 
   React.useEffect(() => {
@@ -372,8 +415,23 @@ export default function App() {
 
     const tick = async () => {
       if (!active) return;
-      const status = (await refreshBatch()) || "ready";
-      if (status === "processing" || status === "cancelling") {
+      const status = await refreshBatch();
+      if (!status) {
+        timer = window.setTimeout(tick, 3000);
+        return;
+      }
+      if (status === "cancelled") {
+        setBatchNotice("Lote cancelado. Vuelve a cargar los archivos.");
+        resetBatchState();
+        return;
+      }
+      if (
+        batchActive ||
+        status === "processing" ||
+        status === "cancelling" ||
+        status === "ready" ||
+        status === "pending"
+      ) {
         timer = window.setTimeout(tick, 3000);
       }
     };
@@ -383,7 +441,7 @@ export default function App() {
       active = false;
       if (timer) window.clearTimeout(timer);
     };
-  }, [batchId]);
+  }, [batchId, batchActive]);
 
   const typedCount = totalPages - counts.SIN;
   const progress = totalPages > 0 ? Math.round((typedCount / totalPages) * 100) : 0;
@@ -398,6 +456,8 @@ export default function App() {
   const batchDone = batchPackages.filter((p) => p.status === "done").length;
   const batchError = batchPackages.filter((p) => p.status === "error").length;
   const batchProgress = batchTotal > 0 ? Math.round(((batchDone + batchError) / batchTotal) * 100) : 0;
+  const effectiveBatchStatus = inferBatchStatus(batchStatus, batchPackages);
+  const batchBusy = effectiveBatchStatus === "processing" || effectiveBatchStatus === "cancelling";
 
   return (
     <div className="app">
@@ -484,33 +544,31 @@ export default function App() {
                 </>
               )}
               <div className="row">
-                <button className="btn btn--outlined" onClick={() => setService(null)}>
+                <button className="btn btn--outlined" onClick={() => setService(null)} disabled={batchBusy}>
                   Cambiar servicio
                 </button>
               </div>
             </div>
+            {batchNotice && <p className="small successText">{batchNotice}</p>}
 
             {showBatch && batchId && (
               <div className="batchCard">
                 <div className="row">
                   <span className="chip">Batch: {batchId}</span>
-                  <span className={`chip chip--status chip--${batchStatus || "ready"}`}>
-                    {batchStatus || "ready"}
+                  <span className={`chip chip--status chip--${effectiveBatchStatus || "ready"}`}>
+                    {effectiveBatchStatus || "ready"}
                   </span>
-                  <button className="btn btn--outlined" onClick={refreshBatch}>
-                    Actualizar
-                  </button>
-                  {batchStatus === "ready" && (
+                  {effectiveBatchStatus === "ready" && (
                     <button className="btn btn--filled" onClick={startBatch}>
                       Iniciar tipificación
                     </button>
                   )}
-                  {(batchStatus === "processing" || batchStatus === "cancelling") && (
+                  {(effectiveBatchStatus === "processing" || effectiveBatchStatus === "cancelling") && (
                     <button className="btn btn--outlined" onClick={cancelBatch}>
-                      Detener
+                      {effectiveBatchStatus === "cancelling" ? "Deteniendo…" : "Detener"}
                     </button>
                   )}
-                  {(batchStatus === "done" || batchStatus === "partial") && (
+                  {(effectiveBatchStatus === "done" || effectiveBatchStatus === "partial") && (
                     <a className="btn btn--filled" href={`${API_BASE}/batch/${batchId}/download/all.zip`}>
                       Descargar todo
                     </a>

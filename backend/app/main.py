@@ -8,6 +8,7 @@ import shutil
 import zipfile
 import subprocess
 import concurrent.futures
+import threading
 from io import BytesIO
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -126,13 +127,63 @@ def _load_batch_meta(batch_id: str) -> dict:
     path = _batch_meta_path(batch_id)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Batch no existe o expiró.")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    for _ in range(3):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            time.sleep(0.05)
+    raise HTTPException(status_code=503, detail="Batch temporalmente ocupado, intenta de nuevo.")
 
 
 def _save_batch_meta(batch_id: str, meta: dict) -> None:
-    with open(_batch_meta_path(batch_id), "w", encoding="utf-8") as f:
+    path = _batch_meta_path(batch_id)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def _reconcile_batch_meta(batch_id: str, meta: dict) -> dict:
+    results_dir = os.path.join(_batch_dir(batch_id), "results")
+    changed = False
+    if os.path.isdir(results_dir):
+        for pkg in meta.get("packages", []):
+            if pkg.get("status") == "done":
+                continue
+            result_file = pkg.get("resultFile") or f"{pkg.get('name')}.zip"
+            result_path = os.path.join(results_dir, result_file)
+            if os.path.exists(result_path):
+                pkg["resultFile"] = result_file
+                pkg["status"] = "done"
+                pkg["error"] = None
+                changed = True
+
+        all_path = os.path.join(results_dir, "all.zip")
+        if os.path.exists(all_path) and meta.get("allZip") != "all.zip":
+            meta["allZip"] = "all.zip"
+            changed = True
+
+    if changed:
+        done_count = sum(1 for p in meta.get("packages", []) if p.get("status") == "done")
+        error_count = sum(1 for p in meta.get("packages", []) if p.get("status") == "error")
+        pending_count = sum(
+            1 for p in meta.get("packages", []) if p.get("status") in {"pending", "processing"}
+        )
+        if pending_count:
+            meta["status"] = "processing"
+        elif error_count and done_count:
+            meta["status"] = "partial"
+        elif error_count and not done_count:
+            meta["status"] = "error"
+        elif done_count:
+            meta["status"] = "done"
+        else:
+            meta["status"] = meta.get("status") or "pending"
+        _save_batch_meta(batch_id, meta)
+    return meta
 
 
 def _cleanup_expired_jobs() -> None:
@@ -766,6 +817,63 @@ def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
     return classifications
 
 
+def _auto_classify_internal_with_cancel(
+    job_id: str,
+    cancel_check: callable,
+) -> Dict[str, Optional[Category]]:
+    meta = _load_meta(job_id)
+    total = meta["totalPages"]
+    classifications: Dict[str, Optional[Category]] = {}
+
+    if not OCR_ENABLED:
+        raise HTTPException(status_code=503, detail="OCR deshabilitado en el servidor.")
+
+    texts: Dict[int, str] = {}
+    for i in range(total):
+        if cancel_check():
+            raise RuntimeError("batch_cancelled")
+        texts[i] = _ocr_page_text(job_id, i)
+
+    # Primera pasada: solo reglas fuertes (sin estructura de tabla)
+    strong: Dict[int, Optional[str]] = {}
+    for i in range(total):
+        strong[i] = _classify_text(texts.get(i, ""), allow_crc_table=False)
+
+    # Determinar en qué PDFs hay encabezado CRC real
+    page_map: List[List[int]] = meta["page_map"]
+    per_pdf: Dict[int, List[int]] = {}
+    for g, pair in enumerate(page_map):
+        pdf_idx = pair[0]
+        per_pdf.setdefault(pdf_idx, []).append(g)
+
+    crc_pdf: Dict[int, bool] = {}
+    for pdf_idx, pages in per_pdf.items():
+        crc_pdf[pdf_idx] = any(strong.get(p) == "CRC" for p in pages)
+
+    # Segunda pasada: permitir tabla CRC solo si el PDF tiene encabezado CRC
+    for i in range(total):
+        pdf_idx = page_map[i][0]
+        if strong.get(i):
+            classifications[str(i)] = strong[i]
+        else:
+            allow_crc = crc_pdf.get(pdf_idx, False)
+            classifications[str(i)] = _classify_text(texts.get(i, ""), allow_crc_table=allow_crc) or "HEV"
+
+    # Propagar clasificación dentro del mismo PDF fuente si existe un encabezado fuerte unico
+    for pdf_idx, pages in per_pdf.items():
+        strong_hits = set()
+        for p in pages:
+            cat = classifications[str(p)]
+            if cat in {"FEV", "CRC", "OPF", "PDE"}:
+                strong_hits.add(cat)
+        if len(strong_hits) == 1:
+            chosen = next(iter(strong_hits))
+            for p in pages:
+                classifications[str(p)] = chosen
+
+    return classifications
+
+
 @app.post("/jobs/{job_id}/auto-classify", response_model=AutoClassifyResponse)
 def auto_classify(job_id: str):
     classifications = _auto_classify_internal(job_id)
@@ -885,14 +993,16 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
         pkg["status"] = "processing"
         pkg["error"] = None
         _save_batch_meta(batch_id, meta)
-        meta = _load_batch_meta(batch_id)
         try:
             pkg_dir = os.path.join(input_dir, pkg["folder"])
             pdfs = _collect_pdf_paths(pkg_dir)
             job_id, _ = _create_job_from_pdf_paths(pdfs)
             pkg["jobId"] = job_id
 
-            classifications = _auto_classify_internal(job_id)
+            classifications = _auto_classify_internal_with_cancel(
+                job_id,
+                cancel_check=lambda: _load_batch_meta(batch_id).get("cancelRequested", False),
+            )
             req = ProcessRequest(classifications=classifications, keepJob=False)
             download_name, zip_bytes = _process_job_bytes(job_id, req)
 
@@ -905,6 +1015,15 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
             pkg["downloadName"] = download_name
             pkg["status"] = "done"
             done += 1
+        except RuntimeError as e:
+            if str(e) == "batch_cancelled":
+                pkg["status"] = "cancelled"
+                pkg["error"] = "cancelled"
+                cancelled = True
+            else:
+                pkg["status"] = "error"
+                pkg["error"] = str(e)
+                errors += 1
         except HTTPException as e:
             pkg["status"] = "error"
             pkg["error"] = e.detail
@@ -936,6 +1055,9 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
     if cancelled:
         meta["status"] = "cancelled"
         meta["cancelRequested"] = False
+        for p in meta.get("packages", []):
+            if p.get("status") in {"pending", "processing"}:
+                p["status"] = "cancelled"
     elif pending_count:
         meta["status"] = "processing"
     elif error_count and done_count:
@@ -1009,7 +1131,7 @@ async def create_batch(background: BackgroundTasks, file: UploadFile = File(...)
 
 @app.get("/batch/{batch_id}")
 def get_batch(batch_id: str):
-    meta = _load_batch_meta(batch_id)
+    meta = _reconcile_batch_meta(batch_id, _load_batch_meta(batch_id))
     return {
         "batchId": meta.get("batchId"),
         "createdAt": meta.get("createdAt"),
@@ -1029,7 +1151,7 @@ def get_batch(batch_id: str):
 
 
 @app.post("/batch/{batch_id}/start")
-def start_batch(batch_id: str, background: BackgroundTasks):
+def start_batch(batch_id: str):
     meta = _load_batch_meta(batch_id)
     if meta.get("status") in {"processing"}:
         return {"batchId": batch_id, "status": meta.get("status")}
@@ -1038,7 +1160,7 @@ def start_batch(batch_id: str, background: BackgroundTasks):
     meta["cancelRequested"] = False
     meta["status"] = "processing"
     _save_batch_meta(batch_id, meta)
-    background.add_task(_process_batch, batch_id)
+    threading.Thread(target=_process_batch, args=(batch_id,), daemon=True).start()
     return {"batchId": batch_id, "status": "processing"}
 
 
@@ -1057,7 +1179,7 @@ def cancel_batch(batch_id: str):
 
 
 @app.post("/batch/{batch_id}/retry-errors")
-def retry_batch_errors(batch_id: str, background: BackgroundTasks):
+def retry_batch_errors(batch_id: str):
     meta = _load_batch_meta(batch_id)
     error_pkgs = [p.get("name") for p in meta.get("packages", []) if p.get("status") == "error"]
     if not error_pkgs:
@@ -1065,13 +1187,13 @@ def retry_batch_errors(batch_id: str, background: BackgroundTasks):
     meta["status"] = "processing"
     meta["cancelRequested"] = False
     _save_batch_meta(batch_id, meta)
-    background.add_task(_process_batch, batch_id, error_pkgs)
+    threading.Thread(target=_process_batch, args=(batch_id, error_pkgs), daemon=True).start()
     return {"batchId": batch_id, "retried": len(error_pkgs)}
 
 
 @app.get("/batch/{batch_id}/download/all.zip")
 def download_batch_all(batch_id: str):
-    meta = _load_batch_meta(batch_id)
+    meta = _reconcile_batch_meta(batch_id, _load_batch_meta(batch_id))
     if not meta.get("allZip"):
         raise HTTPException(status_code=404, detail="ZIP consolidado no disponible.")
     results_dir = os.path.join(_batch_dir(batch_id), "results")
@@ -1087,7 +1209,7 @@ def download_batch_all(batch_id: str):
 
 @app.get("/batch/{batch_id}/download/{package_name}.zip")
 def download_batch_package(batch_id: str, package_name: str):
-    meta = _load_batch_meta(batch_id)
+    meta = _reconcile_batch_meta(batch_id, _load_batch_meta(batch_id))
     pkg = next((p for p in meta.get("packages", []) if p.get("name") == package_name), None)
     if not pkg or pkg.get("status") != "done":
         raise HTTPException(status_code=404, detail="Paquete no disponible.")

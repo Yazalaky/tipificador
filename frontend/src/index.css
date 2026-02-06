@@ -222,6 +222,11 @@ select {
 .errorText {
   color: #b91c1c;
 }
+
+.successText {
+  color: #0f766e;
+  font-weight: 600;
+}
 .card {
   background: var(--md-sys-color-surface);
   border-radius: 18px;
