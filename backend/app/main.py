@@ -41,6 +41,9 @@ OCR_ENABLED = os.environ.get("TIPIFICADOR_OCR_ENABLED", "1").lower() not in {"0"
 OCR_LANG = os.environ.get("TIPIFICADOR_OCR_LANG", "spa+eng")
 OCR_DPI = int(os.environ.get("TIPIFICADOR_OCR_DPI", "300"))
 OCR_PSM = os.environ.get("TIPIFICADOR_OCR_PSM", "4")
+OCR_HEADER_RATIO = float(os.environ.get("TIPIFICADOR_OCR_HEADER_RATIO", "0.35"))
+OCR_HEADER_DPI = int(os.environ.get("TIPIFICADOR_OCR_HEADER_DPI", str(min(200, OCR_DPI))))
+OCR_MIN_TEXT_LEN = int(os.environ.get("TIPIFICADOR_OCR_MIN_TEXT_LEN", "40"))
 OCR_KEEP_IMAGES = os.environ.get("TIPIFICADOR_OCR_KEEP_IMAGES", "0").lower() in {"1", "true", "yes"}
 OCR_WORKERS = int(os.environ.get("TIPIFICADOR_OCR_WORKERS", "4"))
 MAX_BATCH_PACKAGES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_PACKAGES", "10"))
@@ -404,10 +407,43 @@ def _classify_text(text: str, allow_crc_table: bool = False) -> Optional[str]:
     return None
 
 
-def _ocr_page_text(job_id: str, page_index: int) -> str:
+def _text_is_useful(text: str) -> bool:
+    return bool(text and len(text.strip()) >= OCR_MIN_TEXT_LEN)
+
+
+def _extract_page_text(job_id: str, page_index: int) -> str:
+    cache_txt = os.path.join(_job_dir(job_id), "cache", f"text_{page_index}.txt")
+    if os.path.exists(cache_txt):
+        with open(cache_txt, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+
+    meta = _load_meta(job_id)
+    pdf_idx, src_page = meta["page_map"][page_index]
+    doc = _open_source_pdf(job_id, pdf_idx)
+    try:
+        page = doc.load_page(src_page)
+        text = page.get_text("text") or ""
+    finally:
+        doc.close()
+
+    try:
+        with open(cache_txt, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        pass
+    return text
+
+
+def _ocr_cache_paths(job_id: str, page_index: int, suffix: str = "") -> Tuple[str, str]:
+    base = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}{suffix}")
+    return f"{base}.txt", f"{base}.png"
+
+
+def _ocr_page_text(job_id: str, page_index: int, header_only: bool = False) -> str:
     if not OCR_ENABLED:
         return ""
-    cache_txt = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}.txt")
+    suffix = "_head" if header_only else ""
+    cache_txt, img_path = _ocr_cache_paths(job_id, page_index, suffix)
     if os.path.exists(cache_txt):
         with open(cache_txt, "r", encoding="utf-8") as f:
             return f.read()
@@ -417,14 +453,20 @@ def _ocr_page_text(job_id: str, page_index: int) -> str:
     doc = _open_source_pdf(job_id, pdf_idx)
     try:
         page = doc.load_page(src_page)
-        zoom = OCR_DPI / 72.0
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        img_path = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}.png")
+        dpi = OCR_HEADER_DPI if header_only else OCR_DPI
+        zoom = dpi / 72.0
+        if header_only:
+            rect = page.rect
+            header_h = max(1.0, rect.height * OCR_HEADER_RATIO)
+            clip = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + header_h)
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, clip=clip)
+        else:
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         pix.save(img_path)
     finally:
         doc.close()
 
-    out_base = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}")
+    out_base = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}{suffix}")
     cmd = ["tesseract", img_path, out_base, "-l", OCR_LANG, "--psm", str(OCR_PSM)]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0 and OCR_LANG != "eng":
@@ -444,10 +486,32 @@ def _ocr_page_text(job_id: str, page_index: int) -> str:
 
     return text
 
+def _page_text_for_classification(job_id: str, page_index: int, cancel_check: Optional[callable] = None) -> str:
+    if cancel_check and cancel_check():
+        raise RuntimeError("batch_cancelled")
+    # 1) Texto embebido del PDF (rápido)
+    text = _extract_page_text(job_id, page_index)
+    if _text_is_useful(text):
+        if _classify_text(text, allow_crc_table=True):
+            return text
+        if cancel_check and cancel_check():
+            raise RuntimeError("batch_cancelled")
+        header_text = _ocr_page_text(job_id, page_index, header_only=True)
+        if _classify_text(header_text, allow_crc_table=False):
+            return header_text
+        return text
 
-def _ocr_cache_paths(job_id: str, page_index: int) -> Tuple[str, str]:
-    base = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}")
-    return f"{base}.txt", f"{base}.png"
+    # 2) OCR de cabecera (rápido)
+    if cancel_check and cancel_check():
+        raise RuntimeError("batch_cancelled")
+    header_text = _ocr_page_text(job_id, page_index, header_only=True)
+    if _classify_text(header_text, allow_crc_table=False):
+        return header_text
+
+    # 3) OCR completo (fallback para tablas / scans)
+    if cancel_check and cancel_check():
+        raise RuntimeError("batch_cancelled")
+    return _ocr_page_text(job_id, page_index, header_only=False)
 
 
 def _extract_nit_invoice_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -766,7 +830,7 @@ def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
         raise HTTPException(status_code=503, detail="OCR deshabilitado en el servidor.")
 
     def _ocr_for_index(idx: int) -> Tuple[int, str]:
-        return idx, _ocr_page_text(job_id, idx)
+        return idx, _page_text_for_classification(job_id, idx)
 
     texts: Dict[int, str] = {}
     if OCR_WORKERS > 1 and total > 1:
@@ -775,7 +839,7 @@ def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
                 texts[idx] = text
     else:
         for i in range(total):
-            texts[i] = _ocr_page_text(job_id, i)
+            texts[i] = _page_text_for_classification(job_id, i)
 
     # Primera pasada: solo reglas fuertes (sin estructura de tabla)
     strong: Dict[int, Optional[str]] = {}
@@ -830,9 +894,7 @@ def _auto_classify_internal_with_cancel(
 
     texts: Dict[int, str] = {}
     for i in range(total):
-        if cancel_check():
-            raise RuntimeError("batch_cancelled")
-        texts[i] = _ocr_page_text(job_id, i)
+        texts[i] = _page_text_for_classification(job_id, i, cancel_check=cancel_check)
 
     # Primera pasada: solo reglas fuertes (sin estructura de tabla)
     strong: Dict[int, Optional[str]] = {}
