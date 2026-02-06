@@ -155,6 +155,73 @@ select {
   justify-items: center;
 }
 
+.modeToggle {
+  display: inline-flex;
+  gap: 10px;
+  padding: 6px;
+  border-radius: 999px;
+  background: var(--md-sys-color-surface-variant);
+}
+
+.btn.is-active {
+  box-shadow: inset 0 0 0 2px rgba(15, 107, 99, 0.35);
+}
+
+.batchCard {
+  width: min(980px, 100%);
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.batchProgress {
+  display: grid;
+  gap: 8px;
+}
+
+.batchList {
+  display: grid;
+  gap: 8px;
+}
+
+.batchItem {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #f5f7f6;
+}
+
+.batchName {
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface);
+}
+
+.chip--status {
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.chip--done { background: #d1fae5; color: #065f46; }
+.chip--processing { background: #e0f2fe; color: #075985; }
+.chip--pending { background: #f1f5f9; color: #475569; }
+.chip--ready { background: #eef2f1; color: #475569; }
+.chip--cancelling { background: #fde68a; color: #92400e; }
+.chip--cancelled { background: #e5e7eb; color: #6b7280; }
+.chip--partial { background: #fef3c7; color: #92400e; }
+.chip--error { background: #fee2e2; color: #991b1b; }
+
+.btn--sm {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.errorText {
+  color: #b91c1c;
+}
 .card {
   background: var(--md-sys-color-surface);
   border-radius: 18px;

@@ -18,6 +18,15 @@ type DetectError = {
 };
 
 type ServiceId = "cuidador";
+type ModeId = "single" | "batch";
+
+type BatchPackage = {
+  name: string;
+  status: string;
+  jobId?: string | null;
+  downloadName?: string | null;
+  error?: string | null;
+};
 
 const SERVICES: { id: ServiceId | "soon"; label: string; enabled: boolean }[] = [
   { id: "cuidador", label: "Cuidador", enabled: true },
@@ -33,7 +42,9 @@ export default function App() {
   const [totalPages, setTotalPages] = useState<number>(0);
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const batchInputRef = useRef<HTMLInputElement | null>(null);
   const [service, setService] = useState<ServiceId | null>(null);
+  const [mode, setMode] = useState<ModeId>("single");
 
   // classifications: pageIndex -> Category | null
   const [cls, setCls] = useState<Record<number, Category | null>>({});
@@ -49,6 +60,11 @@ export default function App() {
   const [processing, setProcessing] = useState(false);
   const [thumbErrors, setThumbErrors] = useState<Set<number>>(new Set());
   const [autoClassifying, setAutoClassifying] = useState(false);
+  const [batchUploading, setBatchUploading] = useState(false);
+  const [batchId, setBatchId] = useState<string | null>(null);
+  const [batchStatus, setBatchStatus] = useState<string | null>(null);
+  const [batchPackages, setBatchPackages] = useState<BatchPackage[]>([]);
+  const [batchRetrying, setBatchRetrying] = useState(false);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { SIN: 0 };
@@ -64,7 +80,7 @@ export default function App() {
   const hasFEV = counts["FEV"] > 0;
   const hasJob = Boolean(jobId && totalPages > 0);
 
-  function resetUI() {
+  function resetJobState() {
     setJobId(null);
     setTotalPages(0);
     setCls({});
@@ -80,23 +96,37 @@ export default function App() {
     }
   }
 
+  function resetBatchState() {
+    setBatchUploading(false);
+    setBatchId(null);
+    setBatchStatus(null);
+    setBatchPackages([]);
+    if (batchInputRef.current) {
+      batchInputRef.current.value = "";
+    }
+  }
+
+  function resetUI() {
+    resetJobState();
+    resetBatchState();
+  }
+
   function selectService(id: ServiceId) {
     resetUI();
+    setMode("single");
     setService(id);
+  }
+
+  function changeMode(next: ModeId) {
+    setMode(next);
+    resetJobState();
+    resetBatchState();
   }
 
   async function onUpload(files: FileList | null) {
     if (!files || files.length === 0) return;
     setUploading(true);
-    setJobId(null);
-    setTotalPages(0);
-    setCls({});
-    setSelected(new Set());
-    setPreviewPage(null);
-    setNeedOverride(null);
-    setNitOverride("");
-    setOcfeOverride("");
-    setThumbErrors(new Set());
+    resetJobState();
 
     const form = new FormData();
     for (const f of Array.from(files)) {
@@ -229,7 +259,7 @@ export default function App() {
 
     setProcessing(false);
     // job is deleted server-side after process; reset UI to start a new batch
-    resetUI();
+    resetJobState();
   }
 
   async function autoClassify() {
@@ -259,13 +289,115 @@ export default function App() {
     }
   }
 
+  async function onBatchUpload(file: File | null) {
+    if (!file) return;
+    resetBatchState();
+    setBatchUploading(true);
+
+    const form = new FormData();
+    form.append("file", file);
+
+    const res = await fetch(`${API_BASE}/batch`, {
+      method: "POST",
+      body: form,
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      setBatchUploading(false);
+      alert(`Error subiendo lote: ${t}`);
+      return;
+    }
+
+    const data = await res.json();
+    setBatchId(data.batchId);
+    setBatchStatus("ready");
+    setBatchUploading(false);
+    await refreshBatch();
+  }
+
+  async function refreshBatch() {
+    if (!batchId) return null;
+    const res = await fetch(`${API_BASE}/batch/${batchId}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const status = data.status || "pending";
+    setBatchStatus(status);
+    setBatchPackages((data.packages || []) as BatchPackage[]);
+    return status;
+  }
+
+  async function retryBatchErrors() {
+    if (!batchId) return;
+    setBatchRetrying(true);
+    const res = await fetch(`${API_BASE}/batch/${batchId}/retry-errors`, { method: "POST" });
+    if (!res.ok) {
+      const t = await res.text();
+      alert(`Error reintentando: ${t}`);
+      setBatchRetrying(false);
+      return;
+    }
+    setBatchStatus("processing");
+    setBatchRetrying(false);
+    await refreshBatch();
+  }
+
+  async function startBatch() {
+    if (!batchId) return;
+    const res = await fetch(`${API_BASE}/batch/${batchId}/start`, { method: "POST" });
+    if (!res.ok) {
+      const t = await res.text();
+      alert(`Error iniciando lote: ${t}`);
+      return;
+    }
+    setBatchStatus("processing");
+    await refreshBatch();
+  }
+
+  async function cancelBatch() {
+    if (!batchId) return;
+    const res = await fetch(`${API_BASE}/batch/${batchId}/cancel`, { method: "POST" });
+    if (!res.ok) {
+      const t = await res.text();
+      alert(`Error cancelando lote: ${t}`);
+      return;
+    }
+    await refreshBatch();
+  }
+
+  React.useEffect(() => {
+    if (!batchId) return;
+    let timer: number | null = null;
+    let active = true;
+
+    const tick = async () => {
+      if (!active) return;
+      const status = (await refreshBatch()) || "ready";
+      if (status === "processing" || status === "cancelling") {
+        timer = window.setTimeout(tick, 3000);
+      }
+    };
+
+    tick();
+    return () => {
+      active = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [batchId]);
+
   const typedCount = totalPages - counts.SIN;
   const progress = totalPages > 0 ? Math.round((typedCount / totalPages) * 100) : 0;
 
   const fileButtonClass = uploading ? "fileButton fileButton--disabled" : "fileButton";
+  const batchButtonClass = batchUploading ? "fileButton fileButton--disabled" : "fileButton";
   const showHome = !service;
   const showUpload = Boolean(service) && !hasJob;
   const showWork = hasJob;
+  const showBatch = Boolean(service) && mode === "batch";
+  const batchTotal = batchPackages.length;
+  const batchDone = batchPackages.filter((p) => p.status === "done").length;
+  const batchError = batchPackages.filter((p) => p.status === "error").length;
+  const batchProgress = batchTotal > 0 ? Math.round(((batchDone + batchError) / batchTotal) * 100) : 0;
 
   return (
     <div className="app">
@@ -308,24 +440,120 @@ export default function App() {
         {showUpload && (
           <section className="card centerStage">
             <div className="stageTitle">Tipificador Cloud</div>
+            <div className="modeToggle">
+              <button
+                className={`btn btn--tonal ${mode === "single" ? "is-active" : ""}`}
+                onClick={() => changeMode("single")}
+              >
+                Individual
+              </button>
+              <button
+                className={`btn btn--tonal ${mode === "batch" ? "is-active" : ""}`}
+                onClick={() => changeMode("batch")}
+              >
+                Masivo
+              </button>
+            </div>
             <div className="uploadPanel">
-              <label className={`${fileButtonClass} fileButton--large`}>
-                <input
-                  type="file"
-                  multiple
-                  accept="application/pdf"
-                  onChange={(e) => onUpload(e.target.files)}
-                  disabled={uploading}
-                  ref={fileInputRef}
-                />
-                {uploading ? "Subiendo…" : "Cargar PDFs"}
-              </label>
+              {mode === "single" && (
+                <label className={`${fileButtonClass} fileButton--large`}>
+                  <input
+                    type="file"
+                    multiple
+                    accept="application/pdf"
+                    onChange={(e) => onUpload(e.target.files)}
+                    disabled={uploading}
+                    ref={fileInputRef}
+                  />
+                  {uploading ? "Subiendo…" : "Cargar PDFs"}
+                </label>
+              )}
+              {mode === "batch" && (
+                <>
+                  <label className={`${batchButtonClass} fileButton--large`}>
+                    <input
+                      type="file"
+                      accept="application/zip"
+                      onChange={(e) => onBatchUpload(e.target.files?.[0] ?? null)}
+                      disabled={batchUploading}
+                      ref={batchInputRef}
+                    />
+                    {batchUploading ? "Subiendo…" : "Cargar ZIP masivo"}
+                  </label>
+                  <p className="small">Formato: ZIP → carpeta → PDFs. Máximo 10 paquetes.</p>
+                </>
+              )}
               <div className="row">
                 <button className="btn btn--outlined" onClick={() => setService(null)}>
                   Cambiar servicio
                 </button>
               </div>
             </div>
+
+            {showBatch && batchId && (
+              <div className="batchCard">
+                <div className="row">
+                  <span className="chip">Batch: {batchId}</span>
+                  <span className={`chip chip--status chip--${batchStatus || "ready"}`}>
+                    {batchStatus || "ready"}
+                  </span>
+                  <button className="btn btn--outlined" onClick={refreshBatch}>
+                    Actualizar
+                  </button>
+                  {batchStatus === "ready" && (
+                    <button className="btn btn--filled" onClick={startBatch}>
+                      Iniciar tipificación
+                    </button>
+                  )}
+                  {(batchStatus === "processing" || batchStatus === "cancelling") && (
+                    <button className="btn btn--outlined" onClick={cancelBatch}>
+                      Detener
+                    </button>
+                  )}
+                  {(batchStatus === "done" || batchStatus === "partial") && (
+                    <a className="btn btn--filled" href={`${API_BASE}/batch/${batchId}/download/all.zip`}>
+                      Descargar todo
+                    </a>
+                  )}
+                  {batchError > 0 && (
+                    <button
+                      className="btn btn--tonal"
+                      onClick={retryBatchErrors}
+                      disabled={batchRetrying}
+                    >
+                      {batchRetrying ? "Reintentando…" : "Reintentar errores"}
+                    </button>
+                  )}
+                </div>
+                <div className="batchProgress">
+                  <div className="progressBar" aria-label="progreso lote">
+                    <div className="progressFill" style={{ width: `${batchProgress}%` }} />
+                  </div>
+                  <div className="row statsRow">
+                    <span className="chip">Completados: {batchDone}</span>
+                    <span className="chip">Errores: {batchError}</span>
+                    <span className="chip">Total: {batchTotal}</span>
+                  </div>
+                </div>
+                <div className="batchList">
+                  {batchPackages.map((p) => (
+                    <div key={p.name} className="batchItem">
+                      <div className="batchName">{p.name}</div>
+                      <span className={`chip chip--status chip--${p.status}`}>{p.status}</span>
+                      {p.status === "done" && (
+                        <a
+                          className="btn btn--tonal btn--sm"
+                          href={`${API_BASE}/batch/${batchId}/download/${p.name}.zip`}
+                        >
+                          Descargar
+                        </a>
+                      )}
+                      {p.status === "error" && <span className="small errorText">{p.error}</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </section>
         )}
 

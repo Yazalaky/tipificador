@@ -12,7 +12,7 @@ from io import BytesIO
 from typing import Dict, List, Literal, Optional, Tuple
 
 import fitz  # PyMuPDF
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -23,6 +23,8 @@ from pydantic import BaseModel, Field
 # ----------------------------
 JOB_ROOT = os.environ.get("TIPIFICADOR_JOB_ROOT", "/tmp/tipificador_jobs")
 os.makedirs(JOB_ROOT, exist_ok=True)
+BATCH_ROOT = os.path.join(JOB_ROOT, "batches")
+os.makedirs(BATCH_ROOT, exist_ok=True)
 
 CATEGORIES = ["CRC", "FEV", "HEV", "OPF", "PDE"]
 Category = Literal["CRC", "FEV", "HEV", "OPF", "PDE"]
@@ -40,6 +42,8 @@ OCR_DPI = int(os.environ.get("TIPIFICADOR_OCR_DPI", "300"))
 OCR_PSM = os.environ.get("TIPIFICADOR_OCR_PSM", "4")
 OCR_KEEP_IMAGES = os.environ.get("TIPIFICADOR_OCR_KEEP_IMAGES", "0").lower() in {"1", "true", "yes"}
 OCR_WORKERS = int(os.environ.get("TIPIFICADOR_OCR_WORKERS", "4"))
+MAX_BATCH_PACKAGES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_PACKAGES", "10"))
+MAX_BATCH_BYTES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_BYTES", "524288000"))  # 500MB
 
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$", re.IGNORECASE)
 _NIT_RE = re.compile(
@@ -87,6 +91,10 @@ def _job_dir(job_id: str) -> str:
     return os.path.join(JOB_ROOT, job_id)
 
 
+def _batch_dir(batch_id: str) -> str:
+    return os.path.join(BATCH_ROOT, batch_id)
+
+
 def _meta_path(job_id: str) -> str:
     return os.path.join(_job_dir(job_id), "meta.json")
 
@@ -107,6 +115,23 @@ def _load_meta(job_id: str) -> dict:
 
 def _save_meta(job_id: str, meta: dict) -> None:
     with open(_meta_path(job_id), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def _batch_meta_path(batch_id: str) -> str:
+    return os.path.join(_batch_dir(batch_id), "meta.json")
+
+
+def _load_batch_meta(batch_id: str) -> dict:
+    path = _batch_meta_path(batch_id)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Batch no existe o expiró.")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_batch_meta(batch_id: str, meta: dict) -> None:
+    with open(_batch_meta_path(batch_id), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
 
@@ -156,6 +181,79 @@ def _is_probably_pdf(uf: UploadFile) -> bool:
     if ctype and "pdf" not in ctype:
         return False
     return True
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, dest_dir: str) -> None:
+    for member in zf.infolist():
+        name = member.filename
+        if not name or name.endswith("/"):
+            continue
+        norm = os.path.normpath(name)
+        if norm.startswith("..") or os.path.isabs(norm):
+            raise HTTPException(status_code=400, detail="ZIP inválido: rutas inseguras.")
+        target = os.path.join(dest_dir, norm)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with zf.open(member) as src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out)
+
+
+def _collect_pdf_paths(root: str) -> List[str]:
+    pdfs: List[str] = []
+    for base, _, files in os.walk(root):
+        for name in files:
+            if name.lower().endswith(".pdf"):
+                pdfs.append(os.path.join(base, name))
+    return sorted(pdfs)
+
+
+def _create_job_from_pdf_paths(pdf_paths: List[str]) -> Tuple[str, int]:
+    if not pdf_paths:
+        raise HTTPException(status_code=400, detail="Paquete sin PDFs.")
+    if len(pdf_paths) > MAX_FILES:
+        raise HTTPException(status_code=413, detail=f"Máximo {MAX_FILES} PDFs por paquete.")
+
+    job_id = uuid.uuid4().hex
+    jdir = _job_dir(job_id)
+    os.makedirs(jdir, exist_ok=True)
+    os.makedirs(os.path.join(jdir, "pdfs"), exist_ok=True)
+    os.makedirs(os.path.join(jdir, "cache"), exist_ok=True)
+
+    page_map: List[List[int]] = []
+    total_pages = 0
+
+    try:
+        for i, path in enumerate(pdf_paths):
+            if not path.lower().endswith(".pdf"):
+                raise HTTPException(status_code=400, detail=f"Archivo no PDF: {os.path.basename(path)}")
+            if os.path.getsize(path) > MAX_FILE_BYTES:
+                raise HTTPException(status_code=413, detail="Archivo demasiado grande.")
+
+            src_path = os.path.join(jdir, "pdfs", f"src_{i}.pdf")
+            shutil.copyfile(path, src_path)
+
+            try:
+                doc = fitz.open(src_path)
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"PDF inválido o corrupto: {os.path.basename(path)}")
+
+            for p in range(doc.page_count):
+                page_map.append([i, p])
+            total_pages += doc.page_count
+            doc.close()
+
+        meta = {
+            "jobId": job_id,
+            "files": len(pdf_paths),
+            "totalPages": total_pages,
+            "page_map": page_map,
+            "createdAt": time.time(),
+        }
+        _save_meta(job_id, meta)
+    except Exception:
+        shutil.rmtree(jdir, ignore_errors=True)
+        raise
+
+    return job_id, total_pages
 
 
 def _render_page_image(doc: fitz.Document, page_index: int, width: int) -> bytes:
@@ -464,6 +562,11 @@ class AutoClassifyResponse(BaseModel):
     ocrEnabled: bool
 
 
+class BatchCreateResponse(BaseModel):
+    batchId: str
+    packages: int
+
+
 # ----------------------------
 # FastAPI app
 # ----------------------------
@@ -603,8 +706,7 @@ def get_ocr_text(job_id: str, page_index: int, refresh: bool = False):
     return Response(content=text or "", media_type="text/plain; charset=utf-8")
 
 
-@app.post("/jobs/{job_id}/auto-classify", response_model=AutoClassifyResponse)
-def auto_classify(job_id: str):
+def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
     meta = _load_meta(job_id)
     total = meta["totalPages"]
     classifications: Dict[str, Optional[Category]] = {}
@@ -661,11 +763,16 @@ def auto_classify(job_id: str):
             for p in pages:
                 classifications[str(p)] = chosen
 
+    return classifications
+
+
+@app.post("/jobs/{job_id}/auto-classify", response_model=AutoClassifyResponse)
+def auto_classify(job_id: str):
+    classifications = _auto_classify_internal(job_id)
     return AutoClassifyResponse(classifications=classifications, ocrEnabled=OCR_ENABLED)
 
 
-@app.post("/jobs/{job_id}/process")
-def process_job(job_id: str, req: ProcessRequest):
+def _process_job_bytes(job_id: str, req: ProcessRequest) -> Tuple[str, bytes]:
     meta = _load_meta(job_id)
     total = meta["totalPages"]
 
@@ -740,8 +847,260 @@ def process_job(job_id: str, req: ProcessRequest):
     if not req.keepJob:
         shutil.rmtree(_job_dir(job_id), ignore_errors=True)
 
+    filename = f"TIPIFICADO_{nit}_{ocfe}.zip"
+    return filename, zip_data
+
+
+@app.post("/jobs/{job_id}/process")
+def process_job(job_id: str, req: ProcessRequest):
+    filename, zip_data = _process_job_bytes(job_id, req)
     return StreamingResponse(
         BytesIO(zip_data),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="TIPIFICADO_{nit}_{ocfe}.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> None:
+    meta = _load_batch_meta(batch_id)
+    meta["status"] = "processing"
+    _save_batch_meta(batch_id, meta)
+
+    batch_dir = _batch_dir(batch_id)
+    input_dir = os.path.join(batch_dir, "input")
+    results_dir = os.path.join(batch_dir, "results")
+    os.makedirs(results_dir, exist_ok=True)
+
+    target_set = set(target_names or [])
+    done = 0
+    errors = 0
+
+    cancelled = False
+    for pkg in meta.get("packages", []):
+        if meta.get("cancelRequested"):
+            cancelled = True
+            break
+        if target_set and pkg.get("name") not in target_set:
+            continue
+        pkg["status"] = "processing"
+        pkg["error"] = None
+        _save_batch_meta(batch_id, meta)
+        meta = _load_batch_meta(batch_id)
+        try:
+            pkg_dir = os.path.join(input_dir, pkg["folder"])
+            pdfs = _collect_pdf_paths(pkg_dir)
+            job_id, _ = _create_job_from_pdf_paths(pdfs)
+            pkg["jobId"] = job_id
+
+            classifications = _auto_classify_internal(job_id)
+            req = ProcessRequest(classifications=classifications, keepJob=False)
+            download_name, zip_bytes = _process_job_bytes(job_id, req)
+
+            result_filename = f"{pkg['name']}.zip"
+            result_path = os.path.join(results_dir, result_filename)
+            with open(result_path, "wb") as f:
+                f.write(zip_bytes)
+
+            pkg["resultFile"] = result_filename
+            pkg["downloadName"] = download_name
+            pkg["status"] = "done"
+            done += 1
+        except HTTPException as e:
+            pkg["status"] = "error"
+            pkg["error"] = e.detail
+            errors += 1
+        except Exception as e:
+            pkg["status"] = "error"
+            pkg["error"] = str(e)
+            errors += 1
+        _save_batch_meta(batch_id, meta)
+
+    # Build consolidated ZIP
+    all_path = os.path.join(results_dir, "all.zip")
+    with zipfile.ZipFile(all_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for pkg in meta.get("packages", []):
+            if pkg.get("status") != "done":
+                continue
+            result_file = pkg.get("resultFile")
+            if not result_file:
+                continue
+            file_path = os.path.join(results_dir, result_file)
+            arcname = pkg.get("downloadName") or result_file
+            zf.write(file_path, arcname=arcname)
+
+    meta["allZip"] = "all.zip"
+    done_count = sum(1 for p in meta.get("packages", []) if p.get("status") == "done")
+    error_count = sum(1 for p in meta.get("packages", []) if p.get("status") == "error")
+    pending_count = sum(1 for p in meta.get("packages", []) if p.get("status") in {"pending", "processing"})
+
+    if cancelled:
+        meta["status"] = "cancelled"
+        meta["cancelRequested"] = False
+    elif pending_count:
+        meta["status"] = "processing"
+    elif error_count and done_count:
+        meta["status"] = "partial"
+    elif error_count and not done_count:
+        meta["status"] = "error"
+    elif done_count:
+        meta["status"] = "done"
+    else:
+        meta["status"] = "pending"
+    _save_batch_meta(batch_id, meta)
+
+
+@app.post("/batch", response_model=BatchCreateResponse)
+async def create_batch(background: BackgroundTasks, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Debes subir un archivo .zip")
+
+    batch_id = uuid.uuid4().hex
+    bdir = _batch_dir(batch_id)
+    os.makedirs(bdir, exist_ok=True)
+    input_dir = os.path.join(bdir, "input")
+    os.makedirs(input_dir, exist_ok=True)
+
+    zip_path = os.path.join(bdir, "batch.zip")
+    await _save_upload_file_limited(file, zip_path, MAX_BATCH_BYTES)
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            _safe_extract_zip(zf, input_dir)
+    except zipfile.BadZipFile:
+        shutil.rmtree(bdir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="ZIP inválido o corrupto.")
+
+    # Find package folders (top-level)
+    pkg_folders = [
+        name for name in os.listdir(input_dir)
+        if os.path.isdir(os.path.join(input_dir, name)) and not name.startswith("__")
+    ]
+    if not pkg_folders:
+        shutil.rmtree(bdir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="ZIP sin carpetas de paquetes.")
+    if len(pkg_folders) > MAX_BATCH_PACKAGES:
+        shutil.rmtree(bdir, ignore_errors=True)
+        raise HTTPException(status_code=413, detail=f"Máximo {MAX_BATCH_PACKAGES} paquetes por lote.")
+
+    packages = []
+    for folder in sorted(pkg_folders):
+        packages.append({
+            "name": folder,
+            "folder": folder,
+            "status": "pending",
+            "jobId": None,
+            "resultFile": None,
+            "downloadName": None,
+            "error": None,
+        })
+
+    meta = {
+        "batchId": batch_id,
+        "createdAt": time.time(),
+        "status": "ready",
+        "cancelRequested": False,
+        "packages": packages,
+        "allZip": None,
+    }
+    _save_batch_meta(batch_id, meta)
+
+    return BatchCreateResponse(batchId=batch_id, packages=len(packages))
+
+
+@app.get("/batch/{batch_id}")
+def get_batch(batch_id: str):
+    meta = _load_batch_meta(batch_id)
+    return {
+        "batchId": meta.get("batchId"),
+        "createdAt": meta.get("createdAt"),
+        "status": meta.get("status"),
+        "cancelRequested": meta.get("cancelRequested", False),
+        "packages": [
+            {
+                "name": p.get("name"),
+                "status": p.get("status"),
+                "jobId": p.get("jobId"),
+                "downloadName": p.get("downloadName"),
+                "error": p.get("error"),
+            }
+            for p in meta.get("packages", [])
+        ],
+    }
+
+
+@app.post("/batch/{batch_id}/start")
+def start_batch(batch_id: str, background: BackgroundTasks):
+    meta = _load_batch_meta(batch_id)
+    if meta.get("status") in {"processing"}:
+        return {"batchId": batch_id, "status": meta.get("status")}
+    if meta.get("status") in {"done"}:
+        return {"batchId": batch_id, "status": meta.get("status")}
+    meta["cancelRequested"] = False
+    meta["status"] = "processing"
+    _save_batch_meta(batch_id, meta)
+    background.add_task(_process_batch, batch_id)
+    return {"batchId": batch_id, "status": "processing"}
+
+
+@app.post("/batch/{batch_id}/cancel")
+def cancel_batch(batch_id: str):
+    meta = _load_batch_meta(batch_id)
+    if meta.get("status") in {"ready", "pending"}:
+        meta["cancelRequested"] = False
+        meta["status"] = "cancelled"
+        _save_batch_meta(batch_id, meta)
+        return {"batchId": batch_id, "status": meta.get("status")}
+    meta["cancelRequested"] = True
+    meta["status"] = "cancelling"
+    _save_batch_meta(batch_id, meta)
+    return {"batchId": batch_id, "status": "cancelling"}
+
+
+@app.post("/batch/{batch_id}/retry-errors")
+def retry_batch_errors(batch_id: str, background: BackgroundTasks):
+    meta = _load_batch_meta(batch_id)
+    error_pkgs = [p.get("name") for p in meta.get("packages", []) if p.get("status") == "error"]
+    if not error_pkgs:
+        return {"batchId": batch_id, "retried": 0}
+    meta["status"] = "processing"
+    meta["cancelRequested"] = False
+    _save_batch_meta(batch_id, meta)
+    background.add_task(_process_batch, batch_id, error_pkgs)
+    return {"batchId": batch_id, "retried": len(error_pkgs)}
+
+
+@app.get("/batch/{batch_id}/download/all.zip")
+def download_batch_all(batch_id: str):
+    meta = _load_batch_meta(batch_id)
+    if not meta.get("allZip"):
+        raise HTTPException(status_code=404, detail="ZIP consolidado no disponible.")
+    results_dir = os.path.join(_batch_dir(batch_id), "results")
+    all_path = os.path.join(results_dir, meta["allZip"])
+    if not os.path.exists(all_path):
+        raise HTTPException(status_code=404, detail="ZIP consolidado no disponible.")
+    return StreamingResponse(
+        open(all_path, "rb"),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="TIPIFICADO_LOTE.zip"'},
+    )
+
+
+@app.get("/batch/{batch_id}/download/{package_name}.zip")
+def download_batch_package(batch_id: str, package_name: str):
+    meta = _load_batch_meta(batch_id)
+    pkg = next((p for p in meta.get("packages", []) if p.get("name") == package_name), None)
+    if not pkg or pkg.get("status") != "done":
+        raise HTTPException(status_code=404, detail="Paquete no disponible.")
+    result_file = pkg.get("resultFile")
+    if not result_file:
+        raise HTTPException(status_code=404, detail="Paquete no disponible.")
+    results_dir = os.path.join(_batch_dir(batch_id), "results")
+    file_path = os.path.join(results_dir, result_file)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Paquete no disponible.")
+    download_name = pkg.get("downloadName") or f"{package_name}.zip"
+    return StreamingResponse(
+        open(file_path, "rb"),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
     )
