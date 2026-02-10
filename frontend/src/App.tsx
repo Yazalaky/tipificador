@@ -25,7 +25,7 @@ type BatchPackage = {
   status: string;
   jobId?: string | null;
   downloadName?: string | null;
-  error?: string | null;
+  error?: string | Record<string, unknown> | null;
 };
 
 function inferBatchStatus(status: string | null | undefined, packages: BatchPackage[]) {
@@ -44,6 +44,18 @@ function inferBatchStatus(status: string | null | undefined, packages: BatchPack
   if (error && !done) return "error";
   if (done) return "done";
   return status ?? null;
+}
+
+function formatBatchError(err: BatchPackage["error"]) {
+  if (!err) return "";
+  if (typeof err === "string") return err;
+  const msg = (err as Record<string, unknown>)["message"];
+  if (typeof msg === "string") return msg;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return "Error desconocido";
+  }
 }
 
 const SERVICES: { id: ServiceId | "soon"; label: string; enabled: boolean }[] = [
@@ -606,7 +618,9 @@ export default function App() {
                           Descargar
                         </a>
                       )}
-                      {p.status === "error" && <span className="small errorText">{p.error}</span>}
+                      {p.status === "error" && (
+                        <span className="small errorText">{formatBatchError(p.error)}</span>
+                      )}
                     </div>
                   ))}
                 </div>

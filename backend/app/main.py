@@ -9,6 +9,7 @@ import zipfile
 import subprocess
 import concurrent.futures
 import threading
+from datetime import datetime
 from io import BytesIO
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -56,7 +57,11 @@ _NIT_RE = re.compile(
 )
 _OCFE_RE = re.compile(r"\bOCFE\s*(\d{3,})\b", flags=re.IGNORECASE)
 _INVOICE_RE = re.compile(r"\b([A-Z]{3,6})\s*(\d{3,})\b")
-_INVOICE_HINTS = ("FACTURA", "ELECTR", "VENTA", "N°", "NO.", "NRO")
+_INVOICE_HINTS = ("FACTURA", "ELECTR", "VENTA", "N°", "NO.", "NRO", "CUFE", "BUFE")
+_FECHA_CREACION_RE = re.compile(
+    r"FECHA\s*DE\s*CREA(?:CION|CIÓN)\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+    flags=re.IGNORECASE,
+)
 _FEV_HINTS = ("FACTURA ELECTRONICA DE VENTA", "FACTURA ELECTRÓNICA DE VENTA")
 _NC_HINTS = ("NOTA DE CREDITO ELECTRONICA", "NOTA DE CRÉDITO ELECTRONICA")
 _AUTO_RULES_STRONG: List[Tuple[str, Tuple[str, ...]]] = [
@@ -354,7 +359,7 @@ def _normalize_invoice_code(code_raw: str) -> Optional[str]:
     if not m:
         return None
     prefix = m.group(1)
-    if prefix in {"NIT", "CUFE", "CUDE"}:
+    if prefix in {"NIT", "CUDE"}:
         return None
     digits = re.sub(r"\D", "", m.group(2))
     if not digits:
@@ -385,7 +390,11 @@ def _has_crc_table_hint(text: str) -> bool:
     t = _normalize_ocr_text(text)
     if "SERVICIO" not in t or "PRESTADOR" not in t:
         return False
-    if not ("TUTOR" in t or "TUTOR/PACIENTE" in t or "FIRMA" in t):
+    if not ("TURNO" in t and ("HORA" in t or "HORARIO" in t)):
+        return False
+    if not ("NOMBRE" in t and ("TUTOR" in t or "PACIENTE" in t)):
+        return False
+    if "FIRMA" not in t:
         return False
     if not ("N." in t or "N°" in t or "NO." in t or "NRO" in t):
         return False
@@ -398,11 +407,13 @@ def _classify_text(text: str, allow_crc_table: bool = False) -> Optional[str]:
     if not text:
         return None
     t = _normalize_ocr_text(text)
+    if "REGISTRO DE ACTIVIDADES DE CUIDADO" in t or "REGISTRO DE ACTIVIDADES DE CUIDADOR" in t:
+        return "HEV"
     for cat, patterns in _AUTO_RULES_STRONG:
         for p in patterns:
             if p in t:
                 return cat
-    if allow_crc_table and _has_crc_table_hint(t):
+    if _has_crc_table_hint(t):
         return "CRC"
     return None
 
@@ -512,6 +523,51 @@ def _page_text_for_classification(job_id: str, page_index: int, cancel_check: Op
     if cancel_check and cancel_check():
         raise RuntimeError("batch_cancelled")
     return _ocr_page_text(job_id, page_index, header_only=False)
+
+
+def _read_cached_text(path: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _extract_fecha_creacion(text: str) -> Optional[datetime]:
+    if not text:
+        return None
+    m = _FECHA_CREACION_RE.search(text)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%d/%m/%Y")
+    except ValueError:
+        return None
+
+
+def _get_fecha_creacion_for_page(job_id: str, page_index: int) -> Optional[datetime]:
+    # 1) texto embebido cacheado
+    text = _extract_page_text(job_id, page_index)
+    date = _extract_fecha_creacion(text)
+    if date:
+        return date
+
+    # 2) OCR cacheado (si existe, no ejecutar OCR nuevo)
+    txt_head, _ = _ocr_cache_paths(job_id, page_index, "_head")
+    text = _read_cached_text(txt_head)
+    date = _extract_fecha_creacion(text or "")
+    if date:
+        return date
+
+    txt_full, _ = _ocr_cache_paths(job_id, page_index, "")
+    text = _read_cached_text(txt_full)
+    date = _extract_fecha_creacion(text or "")
+    if date:
+        return date
+
+    return None
 
 
 def _extract_nit_invoice_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -870,13 +926,16 @@ def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
     for pdf_idx, pages in per_pdf.items():
         strong_hits = set()
         for p in pages:
-            cat = classifications[str(p)]
-            if cat in {"FEV", "CRC", "OPF", "PDE"}:
+            cat = strong.get(p)
+            if cat:
                 strong_hits.add(cat)
         if len(strong_hits) == 1:
             chosen = next(iter(strong_hits))
-            for p in pages:
-                classifications[str(p)] = chosen
+            if chosen in {"FEV", "CRC", "OPF", "PDE"}:
+                for p in pages:
+                    # Solo propagar a páginas sin encabezado fuerte propio
+                    if not strong.get(p):
+                        classifications[str(p)] = chosen
 
     return classifications
 
@@ -925,13 +984,15 @@ def _auto_classify_internal_with_cancel(
     for pdf_idx, pages in per_pdf.items():
         strong_hits = set()
         for p in pages:
-            cat = classifications[str(p)]
-            if cat in {"FEV", "CRC", "OPF", "PDE"}:
+            cat = strong.get(p)
+            if cat:
                 strong_hits.add(cat)
         if len(strong_hits) == 1:
             chosen = next(iter(strong_hits))
-            for p in pages:
-                classifications[str(p)] = chosen
+            if chosen in {"FEV", "CRC", "OPF", "PDE"}:
+                for p in pages:
+                    if not strong.get(p):
+                        classifications[str(p)] = chosen
 
     return classifications
 
@@ -1004,6 +1065,12 @@ def _process_job_bytes(job_id: str, req: ProcessRequest) -> Tuple[str, bytes]:
         pages = pages_by_cat[cat]
         if not pages:
             continue
+        if cat == "HEV":
+            keyed = []
+            for idx in pages:
+                fecha = _get_fecha_creacion_for_page(job_id, idx)
+                keyed.append((1 if fecha is None else 0, fecha or datetime.max, idx))
+            pages = [k[2] for k in sorted(keyed)]
         doc_out = _build_pdf_from_global_pages(job_id, pages)
         pdf_bytes = doc_out.tobytes()
         doc_out.close()
@@ -1017,7 +1084,7 @@ def _process_job_bytes(job_id: str, req: ProcessRequest) -> Tuple[str, bytes]:
     if not req.keepJob:
         shutil.rmtree(_job_dir(job_id), ignore_errors=True)
 
-    filename = f"TIPIFICADO_{nit}_{ocfe}.zip"
+    filename = f"{ocfe}.zip"
     return filename, zip_data
 
 
@@ -1088,7 +1155,10 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
                 errors += 1
         except HTTPException as e:
             pkg["status"] = "error"
-            pkg["error"] = e.detail
+            if isinstance(e.detail, dict) and "message" in e.detail:
+                pkg["error"] = e.detail.get("message")
+            else:
+                pkg["error"] = str(e.detail)
             errors += 1
         except Exception as e:
             pkg["status"] = "error"
