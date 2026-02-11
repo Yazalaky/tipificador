@@ -5,12 +5,6 @@ const CATEGORIES: Category[] = ["CRC", "FEV", "HEV", "OPF", "PDE"];
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
-type CreateJobResponse = {
-  jobId: string;
-  totalPages: number;
-  files: number;
-};
-
 type DetectError = {
   message: string;
   nitDetected?: string | null;
@@ -70,11 +64,9 @@ const SERVICES: { id: ServiceId | "soon"; label: string; enabled: boolean }[] = 
 export default function App() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [totalPages, setTotalPages] = useState<number>(0);
-  const [uploading, setUploading] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const batchInputRef = useRef<HTMLInputElement | null>(null);
   const [service, setService] = useState<ServiceId | null>(null);
-  const [mode, setMode] = useState<ModeId>("single");
+  const [mode, setMode] = useState<ModeId>("batch");
 
   // classifications: pageIndex -> Category | null
   const [cls, setCls] = useState<Record<number, Category | null>>({});
@@ -123,9 +115,6 @@ export default function App() {
     setOcfeOverride("");
     setThumbErrors(new Set());
     lastClicked.current = null;
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
   }
 
   function resetBatchState() {
@@ -147,42 +136,8 @@ export default function App() {
 
   function selectService(id: ServiceId) {
     resetUI();
-    setMode("single");
+    setMode("batch");
     setService(id);
-  }
-
-  function changeMode(next: ModeId) {
-    setMode(next);
-    resetJobState();
-    resetBatchState();
-  }
-
-  async function onUpload(files: FileList | null) {
-    if (!files || files.length === 0) return;
-    setUploading(true);
-    resetJobState();
-
-    const form = new FormData();
-    for (const f of Array.from(files)) {
-      form.append("files", f);
-    }
-
-    const res = await fetch(`${API_BASE}/jobs`, {
-      method: "POST",
-      body: form,
-    });
-
-    if (!res.ok) {
-      const t = await res.text();
-      setUploading(false);
-      alert(`Error subiendo PDFs: ${t}`);
-      return;
-    }
-
-    const data = (await res.json()) as CreateJobResponse;
-    setJobId(data.jobId);
-    setTotalPages(data.totalPages);
-    setUploading(false);
   }
 
   function toggleSelect(page: number, e: React.MouseEvent) {
@@ -328,22 +283,67 @@ export default function App() {
     resetBatchState();
     setBatchUploading(true);
 
-    const form = new FormData();
-    form.append("file", file);
+    const tryGcs = async () => {
+      const res = await fetch(`${API_BASE}/batch/upload-url`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: file.name }),
+      });
+      if (!res.ok) {
+        return null;
+      }
+      const data = await res.json();
+      if (!data?.uploadUrl || !data?.gcsPath) {
+        return null;
+      }
+      const putRes = await fetch(data.uploadUrl, {
+        method: "PUT",
+        headers: { "Content-Type": "application/zip" },
+        body: file,
+      });
+      if (!putRes.ok) {
+        throw new Error("No se pudo subir el ZIP a GCS.");
+      }
+      const batchRes = await fetch(`${API_BASE}/batch/from-gcs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gcsPath: data.gcsPath }),
+      });
+      if (!batchRes.ok) {
+        const t = await batchRes.text();
+        throw new Error(t || "No se pudo crear el lote desde GCS.");
+      }
+      return batchRes.json();
+    };
 
-    const res = await fetch(`${API_BASE}/batch`, {
-      method: "POST",
-      body: form,
-    });
-
-    if (!res.ok) {
-      const t = await res.text();
+    let data: any = null;
+    try {
+      data = await tryGcs();
+    } catch (err: any) {
       setBatchUploading(false);
-      alert(`Error subiendo lote: ${t}`);
+      alert(err?.message || "Error subiendo lote a GCS.");
       return;
     }
 
-    const data = await res.json();
+    if (!data) {
+      const form = new FormData();
+      form.append("file", file);
+
+      const res = await fetch(`${API_BASE}/batch`, {
+        method: "POST",
+        body: form,
+      });
+
+      if (!res.ok) {
+        const t = await res.text();
+        setBatchUploading(false);
+        alert(`Error subiendo lote: ${t}`);
+        return;
+      }
+
+      data = await res.json();
+    }
+
     setBatchId(data.batchId);
     setBatchStatus("ready");
     setBatchActive(false);
@@ -458,11 +458,10 @@ export default function App() {
   const typedCount = totalPages - counts.SIN;
   const progress = totalPages > 0 ? Math.round((typedCount / totalPages) * 100) : 0;
 
-  const fileButtonClass = uploading ? "fileButton fileButton--disabled" : "fileButton";
   const batchButtonClass = batchUploading ? "fileButton fileButton--disabled" : "fileButton";
   const showHome = !service;
-  const showUpload = Boolean(service) && !hasJob;
-  const showWork = hasJob;
+  const showUpload = Boolean(service) && mode === "batch";
+  const showWork = hasJob && mode === "single";
   const showBatch = Boolean(service) && mode === "batch";
   const batchTotal = batchPackages.length;
   const batchDone = batchPackages.filter((p) => p.status === "done").length;
@@ -482,7 +481,6 @@ export default function App() {
           {showWork && (
             <>
               <span className="chip">API: {API_BASE.replace(/^https?:\/\//, "")}</span>
-              {uploading && <span className="chip chip--info">Subiendo…</span>}
               {jobId && <span className="chip chip--muted">Job: {jobId}</span>}
               {totalPages > 0 && <span className="chip">Páginas: {totalPages}</span>}
             </>
@@ -513,48 +511,20 @@ export default function App() {
           <section className="card centerStage">
             <div className="stageTitle">Tipificador Cloud</div>
             <div className="modeToggle">
-              <button
-                className={`btn btn--tonal ${mode === "single" ? "is-active" : ""}`}
-                onClick={() => changeMode("single")}
-              >
-                Individual
-              </button>
-              <button
-                className={`btn btn--tonal ${mode === "batch" ? "is-active" : ""}`}
-                onClick={() => changeMode("batch")}
-              >
-                Masivo
-              </button>
+              <span className="chip chip--muted">Modo: Masivo</span>
             </div>
             <div className="uploadPanel">
-              {mode === "single" && (
-                <label className={`${fileButtonClass} fileButton--large`}>
-                  <input
-                    type="file"
-                    multiple
-                    accept="application/pdf"
-                    onChange={(e) => onUpload(e.target.files)}
-                    disabled={uploading}
-                    ref={fileInputRef}
-                  />
-                  {uploading ? "Subiendo…" : "Cargar PDFs"}
-                </label>
-              )}
-              {mode === "batch" && (
-                <>
-                  <label className={`${batchButtonClass} fileButton--large`}>
-                    <input
-                      type="file"
-                      accept="application/zip"
-                      onChange={(e) => onBatchUpload(e.target.files?.[0] ?? null)}
-                      disabled={batchUploading}
-                      ref={batchInputRef}
-                    />
-                    {batchUploading ? "Subiendo…" : "Cargar ZIP masivo"}
-                  </label>
-                  <p className="small">Formato: ZIP → carpeta → PDFs. Máximo 10 paquetes.</p>
-                </>
-              )}
+              <label className={`${batchButtonClass} fileButton--large`}>
+                <input
+                  type="file"
+                  accept="application/zip"
+                  onChange={(e) => onBatchUpload(e.target.files?.[0] ?? null)}
+                  disabled={batchUploading}
+                  ref={batchInputRef}
+                />
+                {batchUploading ? "Subiendo…" : "Cargar ZIP masivo"}
+              </label>
+              <p className="small">Formato: ZIP → carpeta → PDFs. Máximo 10 paquetes.</p>
               <div className="row">
                 <button className="btn btn--outlined" onClick={() => setService(null)} disabled={batchBusy}>
                   Cambiar servicio

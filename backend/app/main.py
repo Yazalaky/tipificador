@@ -9,13 +9,16 @@ import zipfile
 import subprocess
 import concurrent.futures
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Dict, List, Literal, Optional, Tuple
 
 import fitz  # PyMuPDF
+import google.auth
+from google.auth.transport.requests import Request
+from google.cloud import storage
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -49,6 +52,11 @@ OCR_KEEP_IMAGES = os.environ.get("TIPIFICADOR_OCR_KEEP_IMAGES", "0").lower() in 
 OCR_WORKERS = int(os.environ.get("TIPIFICADOR_OCR_WORKERS", "4"))
 MAX_BATCH_PACKAGES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_PACKAGES", "10"))
 MAX_BATCH_BYTES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_BYTES", "524288000"))  # 500MB
+GCS_BUCKET = os.environ.get("TIPIFICADOR_GCS_BUCKET", "").strip()
+GCS_UPLOAD_PREFIX = os.environ.get("TIPIFICADOR_GCS_UPLOAD_PREFIX", "uploads/").strip()
+GCS_RESULTS_PREFIX = os.environ.get("TIPIFICADOR_GCS_RESULTS_PREFIX", "results/").strip()
+GCS_SIGNED_URL_EXP_SECONDS = int(os.environ.get("TIPIFICADOR_GCS_SIGNED_URL_EXP_SECONDS", "3600"))
+GCS_SIGNER_EMAIL = os.environ.get("TIPIFICADOR_GCS_SIGNER_EMAIL", "").strip()
 
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$", re.IGNORECASE)
 _NIT_RE = re.compile(
@@ -62,6 +70,8 @@ _FECHA_CREACION_RE = re.compile(
     r"FECHA\s*DE\s*CREA(?:CION|CIÓN)\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
     flags=re.IGNORECASE,
 )
+_DATE_RE = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
+_TIME_RE = re.compile(r"\b\d{2}:\d{2}\b")
 _FEV_HINTS = ("FACTURA ELECTRONICA DE VENTA", "FACTURA ELECTRÓNICA DE VENTA")
 _NC_HINTS = ("NOTA DE CREDITO ELECTRONICA", "NOTA DE CRÉDITO ELECTRONICA")
 _AUTO_RULES_STRONG: List[Tuple[str, Tuple[str, ...]]] = [
@@ -87,6 +97,14 @@ _AUTO_RULES_STRONG: List[Tuple[str, Tuple[str, ...]]] = [
         (
             "REGISTRO DE ACTIVIDADES DE CUIDADO",
             "REGISTRO DE ACTIVIDADES DE CUIDADOR",
+        ),
+    ),
+    (
+        "HEV",
+        (
+            "HISTORIA CLINICA",
+            "HISTORIA CLÍNICA",
+            "TRABAJO SOCIAL",
         ),
     ),
     ("FEV", ("FACTURA ELECTRONICA DE VENTA", "NOTA DE CREDITO ELECTRONICA", "NOTA DE CRÉDITO ELECTRONICA", "DETALLE DE CARGOS", "FACTURA OCFE")),
@@ -152,6 +170,107 @@ def _save_batch_meta(batch_id: str, meta: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
+
+
+def _gcs_enabled() -> bool:
+    return bool(GCS_BUCKET)
+
+
+def _gcs_client() -> storage.Client:
+    return storage.Client()
+
+
+def _normalize_prefix(prefix: str) -> str:
+    if not prefix:
+        return ""
+    return prefix if prefix.endswith("/") else f"{prefix}/"
+
+
+def _safe_object_name(name: str) -> str:
+    base = os.path.basename(name or "batch.zip")
+    base = base.replace(" ", "_")
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+
+
+def _parse_gcs_path(path: str) -> Tuple[str, str]:
+    if path.startswith("gs://"):
+        parts = path[5:].split("/", 1)
+        bucket = parts[0]
+        obj = parts[1] if len(parts) > 1 else ""
+        return bucket, obj
+    return GCS_BUCKET, path.lstrip("/")
+
+
+def _get_signer_email(credentials) -> str:
+    if GCS_SIGNER_EMAIL:
+        return GCS_SIGNER_EMAIL
+    return getattr(credentials, "service_account_email", "") or ""
+
+
+def _signed_url(
+    blob: storage.Blob,
+    method: str,
+    content_type: Optional[str] = None,
+    download_name: Optional[str] = None,
+) -> str:
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    if not credentials.valid:
+        credentials.refresh(Request())
+    signer_email = _get_signer_email(credentials)
+    if not signer_email:
+        raise HTTPException(status_code=500, detail="GCS signer email no configurado.")
+    disposition = None
+    if download_name:
+        disposition = f'attachment; filename="{download_name}"'
+    return blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(seconds=GCS_SIGNED_URL_EXP_SECONDS),
+        method=method,
+        content_type=content_type,
+        response_disposition=disposition,
+        service_account_email=signer_email,
+        access_token=credentials.token,
+    )
+
+
+def _generate_upload_url(object_name: str, content_type: str = "application/zip") -> str:
+    client = _gcs_client()
+    bucket = client.bucket(GCS_BUCKET)
+    blob = bucket.blob(object_name)
+    return _signed_url(blob, method="PUT", content_type=content_type)
+
+
+def _generate_download_url(object_name: str, download_name: Optional[str] = None) -> str:
+    client = _gcs_client()
+    bucket = client.bucket(GCS_BUCKET)
+    blob = bucket.blob(object_name)
+    return _signed_url(blob, method="GET", download_name=download_name)
+
+
+def _restore_batch_input_from_gcs(batch_id: str, source_gcs_path: str) -> None:
+    if not _gcs_enabled():
+        raise HTTPException(status_code=400, detail="GCS no está configurado en el servidor.")
+    bucket_name, object_name = _parse_gcs_path(source_gcs_path)
+    if bucket_name != GCS_BUCKET or not object_name:
+        raise HTTPException(status_code=400, detail="Objeto GCS inválido.")
+
+    client = _gcs_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_name)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="Objeto no encontrado en GCS.")
+
+    bdir = _batch_dir(batch_id)
+    os.makedirs(bdir, exist_ok=True)
+    zip_path = os.path.join(bdir, "batch.zip")
+    input_dir = os.path.join(bdir, "input")
+    if os.path.exists(input_dir):
+        shutil.rmtree(input_dir, ignore_errors=True)
+    os.makedirs(input_dir, exist_ok=True)
+
+    blob.download_to_filename(zip_path)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        _safe_extract_zip(zf, input_dir)
 
 
 def _reconcile_batch_meta(batch_id: str, meta: dict) -> dict:
@@ -388,26 +507,38 @@ def _has_crc_table_hint(text: str) -> bool:
     if not text:
         return False
     t = _normalize_ocr_text(text)
-    if "SERVICIO" not in t or "PRESTADOR" not in t:
-        return False
-    if not ("TURNO" in t and ("HORA" in t or "HORARIO" in t)):
-        return False
-    if not ("NOMBRE" in t and ("TUTOR" in t or "PACIENTE" in t)):
-        return False
-    if "FIRMA" not in t:
-        return False
-    if not ("N." in t or "N°" in t or "NO." in t or "NRO" in t):
-        return False
-    if "ATENCION CUIDADOR" not in t and "CUIDADOR" not in t:
-        return False
-    return True
+    dates = len(_DATE_RE.findall(t))
+    times = len(_TIME_RE.findall(t))
+    has_cuidador = "ATENCION CUIDADOR" in t or "CUIDADOR" in t
+    has_fecha_creacion = "FECHA CREACION" in t
+    header_keys = ("FECHA", "HORA", "TURNO", "SERVICIO", "PRESTADOR", "NOMBRE", "TUTOR", "PACIENTE", "FIRMA")
+    header_hits = sum(1 for k in header_keys if k in t)
+    fallback_rows = has_cuidador and dates >= 2 and times >= 2 and not has_fecha_creacion
+    fallback_headers = has_cuidador and header_hits >= 5 and not has_fecha_creacion
+
+    if (
+        "SERVICIO" in t
+        and "PRESTADOR" in t
+        and ("TURNO" in t and ("HORA" in t or "HORARIO" in t))
+        and ("NOMBRE" in t and ("TUTOR" in t or "PACIENTE" in t))
+        and "FIRMA" in t
+        and ("N." in t or "N°" in t or "NO." in t or "NRO" in t)
+        and ("ATENCION CUIDADOR" in t or "CUIDADOR" in t)
+    ):
+        return True
+
+    return fallback_headers or fallback_rows
 
 
 def _classify_text(text: str, allow_crc_table: bool = False) -> Optional[str]:
     if not text:
         return None
     t = _normalize_ocr_text(text)
+    if "ORDEN MEDICA" in t or "ORDEN MÉDICA" in t:
+        return "OPF"
     if "REGISTRO DE ACTIVIDADES DE CUIDADO" in t or "REGISTRO DE ACTIVIDADES DE CUIDADOR" in t:
+        return "HEV"
+    if "HISTORIA CLINICA" in t or "HISTORIA CLÍNICA" in t or "TRABAJO SOCIAL" in t:
         return "HEV"
     for cat, patterns in _AUTO_RULES_STRONG:
         for p in patterns:
@@ -736,6 +867,20 @@ class AutoClassifyResponse(BaseModel):
 class BatchCreateResponse(BaseModel):
     batchId: str
     packages: int
+
+
+class BatchUploadUrlRequest(BaseModel):
+    filename: str = Field(..., description="Nombre del archivo ZIP")
+
+
+class BatchUploadUrlResponse(BaseModel):
+    uploadUrl: str
+    gcsPath: str
+    objectName: str
+
+
+class BatchFromGCSRequest(BaseModel):
+    gcsPath: str = Field(..., description="Ruta gs://bucket/obj o nombre de objeto")
 
 
 # ----------------------------
@@ -1180,6 +1325,34 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
             zf.write(file_path, arcname=arcname)
 
     meta["allZip"] = "all.zip"
+
+    if _gcs_enabled():
+        try:
+            client = _gcs_client()
+            bucket = client.bucket(GCS_BUCKET)
+            result_prefix = f"{_normalize_prefix(GCS_RESULTS_PREFIX)}{batch_id}/"
+            for pkg in meta.get("packages", []):
+                if pkg.get("status") != "done":
+                    continue
+                result_file = pkg.get("resultFile")
+                if not result_file:
+                    continue
+                local_path = os.path.join(results_dir, result_file)
+                if not os.path.exists(local_path):
+                    continue
+                object_name = f"{result_prefix}{result_file}"
+                blob = bucket.blob(object_name)
+                blob.upload_from_filename(local_path, content_type="application/zip")
+                pkg["gcsResult"] = f"gs://{GCS_BUCKET}/{object_name}"
+
+            if os.path.exists(all_path):
+                all_object = f"{result_prefix}all.zip"
+                blob = bucket.blob(all_object)
+                blob.upload_from_filename(all_path, content_type="application/zip")
+                meta["gcsAllZip"] = f"gs://{GCS_BUCKET}/{all_object}"
+        except Exception as e:
+            meta["gcsError"] = str(e)
+
     done_count = sum(1 for p in meta.get("packages", []) if p.get("status") == "done")
     error_count = sum(1 for p in meta.get("packages", []) if p.get("status") == "error")
     pending_count = sum(1 for p in meta.get("packages", []) if p.get("status") in {"pending", "processing"})
@@ -1203,19 +1376,11 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
     _save_batch_meta(batch_id, meta)
 
 
-@app.post("/batch", response_model=BatchCreateResponse)
-async def create_batch(background: BackgroundTasks, file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Debes subir un archivo .zip")
-
-    batch_id = uuid.uuid4().hex
-    bdir = _batch_dir(batch_id)
-    os.makedirs(bdir, exist_ok=True)
+def _build_batch_from_zip(
+    batch_id: str, zip_path: str, bdir: str, source_gcs_path: Optional[str] = None
+) -> BatchCreateResponse:
     input_dir = os.path.join(bdir, "input")
     os.makedirs(input_dir, exist_ok=True)
-
-    zip_path = os.path.join(bdir, "batch.zip")
-    await _save_upload_file_limited(file, zip_path, MAX_BATCH_BYTES)
 
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
@@ -1224,7 +1389,6 @@ async def create_batch(background: BackgroundTasks, file: UploadFile = File(...)
         shutil.rmtree(bdir, ignore_errors=True)
         raise HTTPException(status_code=400, detail="ZIP inválido o corrupto.")
 
-    # Find package folders (top-level)
     pkg_folders = [
         name for name in os.listdir(input_dir)
         if os.path.isdir(os.path.join(input_dir, name)) and not name.startswith("__")
@@ -1246,6 +1410,7 @@ async def create_batch(background: BackgroundTasks, file: UploadFile = File(...)
             "resultFile": None,
             "downloadName": None,
             "error": None,
+            "gcsResult": None,
         })
 
     meta = {
@@ -1255,10 +1420,68 @@ async def create_batch(background: BackgroundTasks, file: UploadFile = File(...)
         "cancelRequested": False,
         "packages": packages,
         "allZip": None,
+        "gcsAllZip": None,
+        "sourceGcsPath": source_gcs_path,
     }
     _save_batch_meta(batch_id, meta)
 
     return BatchCreateResponse(batchId=batch_id, packages=len(packages))
+
+
+@app.post("/batch", response_model=BatchCreateResponse)
+async def create_batch(background: BackgroundTasks, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Debes subir un archivo .zip")
+
+    batch_id = uuid.uuid4().hex
+    bdir = _batch_dir(batch_id)
+    os.makedirs(bdir, exist_ok=True)
+    input_dir = os.path.join(bdir, "input")
+    os.makedirs(input_dir, exist_ok=True)
+
+    zip_path = os.path.join(bdir, "batch.zip")
+    await _save_upload_file_limited(file, zip_path, MAX_BATCH_BYTES)
+    return _build_batch_from_zip(batch_id, zip_path, bdir, source_gcs_path=req.gcsPath)
+
+
+@app.post("/batch/upload-url", response_model=BatchUploadUrlResponse)
+def batch_upload_url(req: BatchUploadUrlRequest):
+    if not _gcs_enabled():
+        raise HTTPException(status_code=400, detail="GCS no está configurado en el servidor.")
+    prefix = _normalize_prefix(GCS_UPLOAD_PREFIX)
+    safe_name = _safe_object_name(req.filename)
+    object_name = f"{prefix}{uuid.uuid4().hex}_{safe_name}"
+    upload_url = _generate_upload_url(object_name)
+    gcs_path = f"gs://{GCS_BUCKET}/{object_name}"
+    return BatchUploadUrlResponse(uploadUrl=upload_url, gcsPath=gcs_path, objectName=object_name)
+
+
+@app.post("/batch/from-gcs", response_model=BatchCreateResponse)
+def create_batch_from_gcs(req: BatchFromGCSRequest):
+    if not _gcs_enabled():
+        raise HTTPException(status_code=400, detail="GCS no está configurado en el servidor.")
+    bucket_name, object_name = _parse_gcs_path(req.gcsPath)
+    if bucket_name != GCS_BUCKET:
+        raise HTTPException(status_code=400, detail="Bucket no permitido.")
+    if not object_name:
+        raise HTTPException(status_code=400, detail="Objeto GCS inválido.")
+
+    client = _gcs_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_name)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="Objeto no encontrado en GCS.")
+    blob.reload()
+    if blob.size and blob.size > MAX_BATCH_BYTES:
+        raise HTTPException(status_code=413, detail=f"Máximo {MAX_BATCH_BYTES // (1024*1024)}MB por lote.")
+
+    batch_id = uuid.uuid4().hex
+    bdir = _batch_dir(batch_id)
+    os.makedirs(bdir, exist_ok=True)
+    zip_path = os.path.join(bdir, "batch.zip")
+    blob.download_to_filename(zip_path)
+
+    return _build_batch_from_zip(batch_id, zip_path, bdir)
 
 
 @app.get("/batch/{batch_id}")
@@ -1289,6 +1512,11 @@ def start_batch(batch_id: str):
         return {"batchId": batch_id, "status": meta.get("status")}
     if meta.get("status") in {"done"}:
         return {"batchId": batch_id, "status": meta.get("status")}
+    source_gcs = meta.get("sourceGcsPath")
+    if source_gcs:
+        input_dir = os.path.join(_batch_dir(batch_id), "input")
+        if not os.path.isdir(input_dir) or not os.listdir(input_dir):
+            _restore_batch_input_from_gcs(batch_id, source_gcs)
     meta["cancelRequested"] = False
     meta["status"] = "processing"
     _save_batch_meta(batch_id, meta)
@@ -1326,6 +1554,11 @@ def retry_batch_errors(batch_id: str):
 @app.get("/batch/{batch_id}/download/all.zip")
 def download_batch_all(batch_id: str):
     meta = _reconcile_batch_meta(batch_id, _load_batch_meta(batch_id))
+    if _gcs_enabled() and meta.get("gcsAllZip"):
+        bucket, obj = _parse_gcs_path(meta["gcsAllZip"])
+        if bucket == GCS_BUCKET and obj:
+            url = _generate_download_url(obj, "TIPIFICADO_LOTE.zip")
+            return RedirectResponse(url)
     if not meta.get("allZip"):
         raise HTTPException(status_code=404, detail="ZIP consolidado no disponible.")
     results_dir = os.path.join(_batch_dir(batch_id), "results")
@@ -1345,6 +1578,12 @@ def download_batch_package(batch_id: str, package_name: str):
     pkg = next((p for p in meta.get("packages", []) if p.get("name") == package_name), None)
     if not pkg or pkg.get("status") != "done":
         raise HTTPException(status_code=404, detail="Paquete no disponible.")
+    if _gcs_enabled() and pkg.get("gcsResult"):
+        bucket, obj = _parse_gcs_path(pkg["gcsResult"])
+        if bucket == GCS_BUCKET and obj:
+            download_name = pkg.get("downloadName") or f"{package_name}.zip"
+            url = _generate_download_url(obj, download_name)
+            return RedirectResponse(url)
     result_file = pkg.get("resultFile")
     if not result_file:
         raise HTTPException(status_code=404, detail="Paquete no disponible.")

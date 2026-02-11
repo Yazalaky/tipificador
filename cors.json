@@ -1,0 +1,11 @@
+[
+  {
+    "origin": [
+      "https://tipificador-cloud.web.app",
+      "https://tipificador-cloud.firebaseapp.com"
+    ],
+    "method": ["PUT", "GET"],
+    "responseHeader": ["Content-Type"],
+    "maxAgeSeconds": 3600
+  }
+]

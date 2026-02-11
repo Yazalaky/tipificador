@@ -1,0 +1,11 @@
+[
+  {
+    "origin": [
+      "https://TIPIFICADOR_HOST.web.app",
+      "https://TIPIFICADOR_HOST.firebaseapp.com"
+    ],
+    "method": ["PUT", "GET"],
+    "responseHeader": ["Content-Type"],
+    "maxAgeSeconds": 3600
+  }
+]
