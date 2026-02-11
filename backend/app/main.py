@@ -9,7 +9,7 @@ import zipfile
 import subprocess
 import concurrent.futures
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -17,7 +17,7 @@ import fitz  # PyMuPDF
 import google.auth
 from google.auth.transport.requests import Request
 from google.cloud import storage
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header
 from fastapi.responses import Response, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -57,6 +57,8 @@ GCS_UPLOAD_PREFIX = os.environ.get("TIPIFICADOR_GCS_UPLOAD_PREFIX", "uploads/").
 GCS_RESULTS_PREFIX = os.environ.get("TIPIFICADOR_GCS_RESULTS_PREFIX", "results/").strip()
 GCS_SIGNED_URL_EXP_SECONDS = int(os.environ.get("TIPIFICADOR_GCS_SIGNED_URL_EXP_SECONDS", "3600"))
 GCS_SIGNER_EMAIL = os.environ.get("TIPIFICADOR_GCS_SIGNER_EMAIL", "").strip()
+CLEANUP_TOKEN = os.environ.get("TIPIFICADOR_CLEANUP_TOKEN", "").strip()
+CLEANUP_AGE_MINUTES = int(os.environ.get("TIPIFICADOR_CLEANUP_AGE_MINUTES", "30"))
 
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$", re.IGNORECASE)
 _NIT_RE = re.compile(
@@ -199,6 +201,47 @@ def _parse_gcs_path(path: str) -> Tuple[str, str]:
         obj = parts[1] if len(parts) > 1 else ""
         return bucket, obj
     return GCS_BUCKET, path.lstrip("/")
+
+
+def _delete_gcs_object(gcs_path: str) -> None:
+    if not gcs_path or not _gcs_enabled():
+        return
+    bucket_name, object_name = _parse_gcs_path(gcs_path)
+    if not bucket_name or not object_name:
+        return
+    try:
+        client = _gcs_client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_name)
+        if blob.exists():
+            blob.delete()
+    except Exception:
+        # Best-effort cleanup; do not fail batch creation
+        return
+
+
+def _cleanup_gcs_results(max_age_minutes: int) -> int:
+    if not _gcs_enabled():
+        return 0
+    age_minutes = max(1, int(max_age_minutes))
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+    client = _gcs_client()
+    bucket = client.bucket(GCS_BUCKET)
+    prefix = _normalize_prefix(GCS_RESULTS_PREFIX)
+    deleted = 0
+    for blob in client.list_blobs(bucket, prefix=prefix):
+        updated = blob.updated or blob.time_created
+        if not updated:
+            continue
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        if updated <= cutoff:
+            try:
+                blob.delete()
+                deleted += 1
+            except Exception:
+                continue
+    return deleted
 
 
 def _get_signer_email(credentials) -> str:
@@ -905,6 +948,11 @@ class BatchFromGCSRequest(BaseModel):
     gcsPath: str = Field(..., description="Ruta gs://bucket/obj o nombre de objeto")
 
 
+class CleanupResponse(BaseModel):
+    deleted: int
+    olderThanMinutes: int
+
+
 # ----------------------------
 # FastAPI app
 # ----------------------------
@@ -1463,7 +1511,7 @@ async def create_batch(background: BackgroundTasks, file: UploadFile = File(...)
 
     zip_path = os.path.join(bdir, "batch.zip")
     await _save_upload_file_limited(file, zip_path, MAX_BATCH_BYTES)
-    return _build_batch_from_zip(batch_id, zip_path, bdir, source_gcs_path=req.gcsPath)
+    return _build_batch_from_zip(batch_id, zip_path, bdir, source_gcs_path=None)
 
 
 @app.post("/batch/upload-url", response_model=BatchUploadUrlResponse)
@@ -1503,7 +1551,15 @@ def create_batch_from_gcs(req: BatchFromGCSRequest):
     zip_path = os.path.join(bdir, "batch.zip")
     blob.download_to_filename(zip_path)
 
-    return _build_batch_from_zip(batch_id, zip_path, bdir)
+    resp = _build_batch_from_zip(batch_id, zip_path, bdir, source_gcs_path=req.gcsPath)
+    _delete_gcs_object(req.gcsPath)
+    try:
+        meta = _load_batch_meta(batch_id)
+        meta["sourceGcsPath"] = None
+        _save_batch_meta(batch_id, meta)
+    except Exception:
+        pass
+    return resp
 
 
 @app.get("/batch/{batch_id}")
@@ -1571,6 +1627,20 @@ def retry_batch_errors(batch_id: str):
     _save_batch_meta(batch_id, meta)
     threading.Thread(target=_process_batch, args=(batch_id, error_pkgs), daemon=True).start()
     return {"batchId": batch_id, "retried": len(error_pkgs)}
+
+
+@app.post("/admin/cleanup", response_model=CleanupResponse)
+def cleanup_results(
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+    minutes: Optional[int] = None,
+):
+    if CLEANUP_TOKEN and x_admin_token != CLEANUP_TOKEN:
+        raise HTTPException(status_code=403, detail="No autorizado.")
+    if not _gcs_enabled():
+        raise HTTPException(status_code=400, detail="GCS no está configurado en el servidor.")
+    age = minutes if minutes is not None else CLEANUP_AGE_MINUTES
+    deleted = _cleanup_gcs_results(age)
+    return CleanupResponse(deleted=deleted, olderThanMinutes=int(age))
 
 
 @app.get("/batch/{batch_id}/download/all.zip")
