@@ -530,16 +530,38 @@ def _has_crc_table_hint(text: str) -> bool:
     return fallback_headers or fallback_rows
 
 
+def _has_opf_table_hint(text: str) -> bool:
+    if not text:
+        return False
+    t = _normalize_ocr_text(text)
+    has_decision = "DECISION" in t or "DECISIONES" in t
+    has_mes = "MES INICIO" in t or "MES" in t
+    has_detalles = "DETALLES" in t
+    has_obs = "OBSERVACIONES" in t
+    return has_decision and (has_mes or has_detalles or has_obs)
+
+
 def _classify_text(text: str, allow_crc_table: bool = False) -> Optional[str]:
     if not text:
         return None
     t = _normalize_ocr_text(text)
-    if "ORDEN MEDICA" in t or "ORDEN MÉDICA" in t:
+    has_hev_hint = (
+        "REGISTRO DE ACTIVIDADES DE CUIDADO" in t
+        or "REGISTRO DE ACTIVIDADES DE CUIDADOR" in t
+        or "HISTORIA CLINICA" in t
+        or "HISTORIA CLÍNICA" in t
+        or "TRABAJO SOCIAL" in t
+    )
+    has_opf_phrase = "ORDEN MEDICA" in t or "ORDEN MÉDICA" in t
+    has_opf_header = has_opf_phrase and ("DECISIONES" in t or "DECISION" in t)
+    if has_opf_header:
         return "OPF"
-    if "REGISTRO DE ACTIVIDADES DE CUIDADO" in t or "REGISTRO DE ACTIVIDADES DE CUIDADOR" in t:
+    if has_hev_hint:
         return "HEV"
-    if "HISTORIA CLINICA" in t or "HISTORIA CLÍNICA" in t or "TRABAJO SOCIAL" in t:
-        return "HEV"
+    if has_opf_phrase:
+        return "OPF"
+    if _has_opf_table_hint(t):
+        return "OPF"
     for cat, patterns in _AUTO_RULES_STRONG:
         for p in patterns:
             if p in t:
@@ -1076,7 +1098,7 @@ def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
                 strong_hits.add(cat)
         if len(strong_hits) == 1:
             chosen = next(iter(strong_hits))
-            if chosen in {"FEV", "CRC", "OPF", "PDE"}:
+            if chosen in {"FEV", "CRC", "PDE"}:
                 for p in pages:
                     # Solo propagar a páginas sin encabezado fuerte propio
                     if not strong.get(p):
@@ -1134,7 +1156,7 @@ def _auto_classify_internal_with_cancel(
                 strong_hits.add(cat)
         if len(strong_hits) == 1:
             chosen = next(iter(strong_hits))
-            if chosen in {"FEV", "CRC", "OPF", "PDE"}:
+            if chosen in {"FEV", "CRC", "PDE"}:
                 for p in pages:
                     if not strong.get(p):
                         classifications[str(p)] = chosen

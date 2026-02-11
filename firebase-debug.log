@@ -1,10 +1,10 @@
-[debug] [2026-02-10T19:36:50.967Z] ----------------------------------------------------------------------
-[debug] [2026-02-10T19:36:50.968Z] Command:       /usr/bin/node /usr/bin/firebase init
-[debug] [2026-02-10T19:36:50.968Z] CLI Version:   15.5.1
-[debug] [2026-02-10T19:36:50.968Z] Platform:      linux
-[debug] [2026-02-10T19:36:50.968Z] Node Version:  v22.22.0
-[debug] [2026-02-10T19:36:50.969Z] Time:          Tue Feb 10 2026 14:36:50 GMT-0500 (hora estándar de Colombia)
-[debug] [2026-02-10T19:36:50.969Z] ----------------------------------------------------------------------
+[debug] [2026-02-11T18:55:39.436Z] ----------------------------------------------------------------------
+[debug] [2026-02-11T18:55:39.437Z] Command:       /usr/bin/node /usr/bin/firebase init
+[debug] [2026-02-11T18:55:39.437Z] CLI Version:   15.5.1
+[debug] [2026-02-11T18:55:39.437Z] Platform:      linux
+[debug] [2026-02-11T18:55:39.437Z] Node Version:  v22.22.0
+[debug] [2026-02-11T18:55:39.438Z] Time:          Wed Feb 11 2026 13:55:39 GMT-0500 (hora estándar de Colombia)
+[debug] [2026-02-11T18:55:39.438Z] ----------------------------------------------------------------------
 [debug] 
 [info] 
      ######## #### ########  ######## ########     ###     ######  ########
@@ -17,7 +17,7 @@ You're about to initialize a Firebase project in this directory:
 
   /home/sistemas/Proyectos/tipificador-cloud
 
-[debug] [2026-02-10T19:38:22.016Z] ExitPromptError: User force closed the prompt with SIGINT
+[debug] [2026-02-11T18:57:29.272Z] ExitPromptError: User force closed the prompt with SIGINT
     at Interface.sigint (/usr/lib/node_modules/firebase-tools/node_modules/@inquirer/core/dist/commonjs/lib/create-prompt.js:101:37)
     at Interface.emit (node:events:519:28)
     at [_ttyWrite] [as _ttyWrite] (node:internal/readline/interface:1134:18)

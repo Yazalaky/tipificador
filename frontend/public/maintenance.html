@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tipificador Cloud - Mantenimiento</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: light;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+        background:
+          radial-gradient(900px 500px at 0% -10%, #e6efff 0%, transparent 60%),
+          radial-gradient(900px 500px at 100% -20%, #e2f2ff 0%, transparent 60%),
+          #f5f7fb;
+        color: #0f172a;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+      .card {
+        width: min(720px, 100%);
+        background: #ffffff;
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        border-radius: 18px;
+        padding: 32px;
+        box-shadow: 0 16px 30px rgba(15, 23, 42, 0.08);
+        text-align: center;
+      }
+      .brand {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 6px;
+        font-weight: 700;
+        font-size: 20px;
+      }
+      .brand span:last-child {
+        color: #2563eb;
+      }
+      h1 {
+        font-size: 28px;
+        margin: 16px 0 8px;
+      }
+      p {
+        margin: 0;
+        color: #475569;
+        line-height: 1.6;
+      }
+      .badge {
+        display: inline-flex;
+        margin-top: 18px;
+        padding: 6px 14px;
+        border-radius: 999px;
+        background: #e0edff;
+        color: #1e3a8a;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .note {
+        margin-top: 18px;
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <div class="brand">
+        <span>Tipificador</span>
+        <span>Cloud</span>
+      </div>
+      <h1>Estamos en mantenimiento</h1>
+      <p>Estamos realizando ajustes para mejorar la estabilidad del sistema.</p>
+      <p>Por favor, vuelve a intentarlo en unas horas.</p>
+      <div class="badge">Estado: Mantenimiento</div>
+      <p class="note">Si necesitas soporte, comunicate con el equipo de TI.</p>
+    </main>
+  </body>
+</html>
