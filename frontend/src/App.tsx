@@ -52,13 +52,61 @@ function formatBatchError(err: BatchPackage["error"]) {
   }
 }
 
-const SERVICES: { id: ServiceId | "soon"; label: string; enabled: boolean }[] = [
-  { id: "cuidador", label: "Cuidador", enabled: true },
-  { id: "soon", label: "Próximamente", enabled: false },
-  { id: "soon", label: "Próximamente", enabled: false },
-  { id: "soon", label: "Próximamente", enabled: false },
-  { id: "soon", label: "Próximamente", enabled: false },
-  { id: "soon", label: "Próximamente", enabled: false },
+const SERVICES: {
+  id: ServiceId | "soon";
+  label: string;
+  enabled: boolean;
+  desc: string;
+  tag?: string;
+  icon: string;
+}[] = [
+  {
+    id: "cuidador",
+    label: "Cuidador",
+    enabled: true,
+    desc: "Gestión de documentos para cuidadores domiciliarios.",
+    icon: "C",
+  },
+  {
+    id: "soon",
+    label: "Enfermería",
+    enabled: false,
+    desc: "Procesamiento de reportes clínicos y evoluciones.",
+    tag: "Próximamente",
+    icon: "E",
+  },
+  {
+    id: "soon",
+    label: "Terapia Física",
+    enabled: false,
+    desc: "Bitácoras de rehabilitación y seguimiento.",
+    tag: "Próximamente",
+    icon: "T",
+  },
+  {
+    id: "soon",
+    label: "Administrativo",
+    enabled: false,
+    desc: "Facturación y documentos legales.",
+    tag: "Próximamente",
+    icon: "A",
+  },
+  {
+    id: "soon",
+    label: "Auditoría",
+    enabled: false,
+    desc: "Revisión de calidad y conformidad.",
+    tag: "Próximamente",
+    icon: "U",
+  },
+  {
+    id: "soon",
+    label: "Laboratorio",
+    enabled: false,
+    desc: "Resultados y órdenes médicas.",
+    tag: "Próximamente",
+    icon: "L",
+  },
 ];
 
 export default function App() {
@@ -458,7 +506,7 @@ export default function App() {
   const typedCount = totalPages - counts.SIN;
   const progress = totalPages > 0 ? Math.round((typedCount / totalPages) * 100) : 0;
 
-  const batchButtonClass = batchUploading ? "fileButton fileButton--disabled" : "fileButton";
+  const dropzoneClass = batchUploading ? "dropzone dropzone--disabled" : "dropzone";
   const showHome = !service;
   const showUpload = Boolean(service) && mode === "batch";
   const showWork = hasJob && mode === "single";
@@ -472,12 +520,13 @@ export default function App() {
 
   return (
     <div className="app">
-      <header className="topAppBar">
-        <div className="titleWrap">
-          <div className="title">Tipificador Cloud</div>
+      <header className="appHeader">
+        <div className="brand">
+          <span className="brandTitle">Tipificador</span>
+          <span className="brandAccent">Cloud</span>
         </div>
         <div className="row headerMeta">
-          {service && <span className="chip chip--muted">Servicio: Cuidador</span>}
+          {service && <span className="chip chip--info">Servicio: Cuidador</span>}
           {showWork && (
             <>
               <span className="chip">API: {API_BASE.replace(/^https?:\/\//, "")}</span>
@@ -490,17 +539,27 @@ export default function App() {
 
       <main className="content">
         {showHome && (
-          <section className="card centerStage">
-            <div className="stageTitle">Selecciona el servicio</div>
+          <section className="panel heroPanel">
+            <div className="hero">
+              <h1 className="heroTitle">Selecciona el servicio a tipificar</h1>
+              <p className="heroSub">
+                Elige el módulo correspondiente para comenzar la carga y procesamiento de documentos.
+              </p>
+            </div>
             <div className="serviceGrid">
               {SERVICES.map((s, idx) => (
                 <button
                   key={`${s.id}-${idx}`}
-                  className={`serviceCard ${s.enabled ? "" : "serviceCard--disabled"}`}
+                  className={`serviceTile ${s.enabled ? "" : "serviceTile--disabled"}`}
                   onClick={() => s.enabled && selectService("cuidador")}
                   disabled={!s.enabled}
                 >
-                  {s.label}
+                  {s.tag && <span className="serviceBadge">{s.tag}</span>}
+                  <div className="serviceIcon">{s.icon}</div>
+                  <div className="serviceInfo">
+                    <div className="serviceLabel">{s.label}</div>
+                    <div className="serviceDesc">{s.desc}</div>
+                  </div>
                 </button>
               ))}
             </div>
@@ -508,62 +567,91 @@ export default function App() {
         )}
 
         {showUpload && (
-          <section className="card centerStage">
-            <div className="stageTitle">Tipificador Cloud</div>
-            <div className="modeToggle">
-              <span className="chip chip--muted">Modo: Masivo</span>
-            </div>
-            <div className="uploadPanel">
-              <label className={`${batchButtonClass} fileButton--large`}>
-                <input
-                  type="file"
-                  accept="application/zip"
-                  onChange={(e) => onBatchUpload(e.target.files?.[0] ?? null)}
-                  disabled={batchUploading}
-                  ref={batchInputRef}
-                />
-                {batchUploading ? "Subiendo…" : "Cargar ZIP masivo"}
-              </label>
-              <p className="small">Formato: ZIP → carpeta → PDFs. Máximo 10 paquetes.</p>
-              <div className="row">
-                <button className="btn btn--outlined" onClick={() => setService(null)} disabled={batchBusy}>
-                  Cambiar servicio
-                </button>
+          <section className="panel uploadPanel">
+            <div className="panelHeader">
+              <button className="linkButton" onClick={() => setService(null)} disabled={batchBusy}>
+                ← Volver a servicios
+              </button>
+              <div className="panelMeta">
+                <span className="chip chip--muted">Modo: Masivo</span>
+                <span className="chip chip--info">Cuidador</span>
               </div>
             </div>
-            {batchNotice && <p className="small successText">{batchNotice}</p>}
+            <div className="panelTitleRow">
+              <div>
+                <div className="panelEyebrow">Tipificador Cloud</div>
+                <div className="panelTitle">Carga de Documentos</div>
+              </div>
+            </div>
+
+            <div className="requirements">
+              <div className="requirementsTitle">Requisitos del archivo:</div>
+              <ul>
+                <li>Formato aceptado: ZIP únicamente.</li>
+                <li>Estructura interna: ZIP → carpeta → PDFs.</li>
+                <li>Máximo 10 paquetes por carga.</li>
+              </ul>
+            </div>
+
+            <label className={dropzoneClass}>
+              <input
+                type="file"
+                accept="application/zip"
+                onChange={(e) => onBatchUpload(e.target.files?.[0] ?? null)}
+                disabled={batchUploading}
+                ref={batchInputRef}
+              />
+              <div className="dropzoneIcon">ZIP</div>
+              <div className="dropzoneTitle">Arrastra tu archivo ZIP aquí</div>
+              <div className="small">O haz clic en cualquier parte para buscar en tu ordenador.</div>
+              <div className="dropzoneAction">
+                {batchUploading ? "Subiendo…" : "Seleccionar ZIP"}
+              </div>
+            </label>
+
+            <div className="panelActions">
+              <button className="btn btn--outlined" onClick={() => setService(null)} disabled={batchBusy}>
+                Cambiar servicio
+              </button>
+            </div>
+
+            {batchNotice && <p className="notice successText">{batchNotice}</p>}
 
             {showBatch && batchId && (
               <div className="batchCard">
-                <div className="row">
-                  <span className="chip">Batch: {batchId}</span>
-                  <span className={`chip chip--status chip--${effectiveBatchStatus || "ready"}`}>
-                    {effectiveBatchStatus || "ready"}
-                  </span>
-                  {effectiveBatchStatus === "ready" && (
-                    <button className="btn btn--filled" onClick={startBatch}>
-                      Iniciar tipificación
-                    </button>
-                  )}
-                  {(effectiveBatchStatus === "processing" || effectiveBatchStatus === "cancelling") && (
-                    <button className="btn btn--outlined" onClick={cancelBatch}>
-                      {effectiveBatchStatus === "cancelling" ? "Deteniendo…" : "Detener"}
-                    </button>
-                  )}
-                  {(effectiveBatchStatus === "done" || effectiveBatchStatus === "partial") && (
-                    <a className="btn btn--filled" href={`${API_BASE}/batch/${batchId}/download/all.zip`}>
-                      Descargar todo
-                    </a>
-                  )}
-                  {batchError > 0 && (
-                    <button
-                      className="btn btn--tonal"
-                      onClick={retryBatchErrors}
-                      disabled={batchRetrying}
-                    >
-                      {batchRetrying ? "Reintentando…" : "Reintentar errores"}
-                    </button>
-                  )}
+                <div className="batchHeader">
+                  <div className="row">
+                    <span className="chip">Batch: {batchId}</span>
+                    <span className={`chip chip--status chip--${effectiveBatchStatus || "ready"}`}>
+                      {effectiveBatchStatus || "ready"}
+                    </span>
+                  </div>
+                  <div className="row">
+                    {effectiveBatchStatus === "ready" && (
+                      <button className="btn btn--filled" onClick={startBatch}>
+                        Iniciar tipificación
+                      </button>
+                    )}
+                    {(effectiveBatchStatus === "processing" || effectiveBatchStatus === "cancelling") && (
+                      <button className="btn btn--outlined" onClick={cancelBatch}>
+                        {effectiveBatchStatus === "cancelling" ? "Deteniendo…" : "Detener"}
+                      </button>
+                    )}
+                    {(effectiveBatchStatus === "done" || effectiveBatchStatus === "partial") && (
+                      <a className="btn btn--filled" href={`${API_BASE}/batch/${batchId}/download/all.zip`}>
+                        Descargar todo
+                      </a>
+                    )}
+                    {batchError > 0 && (
+                      <button
+                        className="btn btn--tonal"
+                        onClick={retryBatchErrors}
+                        disabled={batchRetrying}
+                      >
+                        {batchRetrying ? "Reintentando…" : "Reintentar errores"}
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="batchProgress">
                   <div className="progressBar" aria-label="progreso lote">
