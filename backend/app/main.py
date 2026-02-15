@@ -573,17 +573,6 @@ def _has_crc_table_hint(text: str) -> bool:
     return fallback_headers or fallback_rows
 
 
-def _has_opf_table_hint(text: str) -> bool:
-    if not text:
-        return False
-    t = _normalize_ocr_text(text)
-    has_decision = "DECISION" in t or "DECISIONES" in t
-    has_mes = "MES INICIO" in t or "MES" in t
-    has_detalles = "DETALLES" in t
-    has_obs = "OBSERVACIONES" in t
-    return has_decision and (has_mes or has_detalles or has_obs)
-
-
 def _classify_text(text: str, allow_crc_table: bool = False) -> Optional[str]:
     if not text:
         return None
@@ -595,15 +584,11 @@ def _classify_text(text: str, allow_crc_table: bool = False) -> Optional[str]:
         or "HISTORIA CLÍNICA" in t
         or "TRABAJO SOCIAL" in t
     )
+    # Regla de negocio: OPF solo aplica si el texto contiene "ORDEN MEDICA".
     has_opf_phrase = "ORDEN MEDICA" in t or "ORDEN MÉDICA" in t
-    has_opf_header = has_opf_phrase and ("DECISIONES" in t or "DECISION" in t)
-    if has_opf_header:
-        return "OPF"
     if has_hev_hint:
         return "HEV"
     if has_opf_phrase:
-        return "OPF"
-    if _has_opf_table_hint(t):
         return "OPF"
     for cat, patterns in _AUTO_RULES_STRONG:
         for p in patterns:
