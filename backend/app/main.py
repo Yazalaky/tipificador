@@ -17,7 +17,7 @@ import fitz  # PyMuPDF
 import google.auth
 from google.auth.transport.requests import Request
 from google.cloud import storage
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header, Form
 from fastapi.responses import Response, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -33,6 +33,7 @@ os.makedirs(BATCH_ROOT, exist_ok=True)
 
 CATEGORIES = ["CRC", "FEV", "HEV", "OPF", "PDE"]
 Category = Literal["CRC", "FEV", "HEV", "OPF", "PDE"]
+SERVICE_IDS = {"cuidador", "otros_servicios"}
 
 THUMB_WIDTH = 240
 VIEW_WIDTH = 1100
@@ -110,6 +111,9 @@ _AUTO_RULES_STRONG: List[Tuple[str, Tuple[str, ...]]] = [
         ),
     ),
     ("FEV", ("FACTURA ELECTRONICA DE VENTA", "NOTA DE CREDITO ELECTRONICA", "NOTA DE CRÉDITO ELECTRONICA", "DETALLE DE CARGOS", "FACTURA OCFE")),
+]
+_AUTO_RULES_FIXED: List[Tuple[str, Tuple[str, ...]]] = [
+    (cat, patterns) for cat, patterns in _AUTO_RULES_STRONG if cat in {"CRC", "FEV", "PDE"}
 ]
 
 
@@ -529,6 +533,11 @@ def _normalize_invoice_code(code_raw: str) -> Optional[str]:
     return f"{prefix}{digits}"
 
 
+def _normalize_service(service_raw: Optional[str]) -> str:
+    s = (service_raw or "cuidador").strip().lower()
+    return s if s in SERVICE_IDS else "cuidador"
+
+
 def _strip_accents(text: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFD", text) if unicodedata.category(ch) != "Mn")
 
@@ -573,9 +582,14 @@ def _has_crc_table_hint(text: str) -> bool:
     return fallback_headers or fallback_rows
 
 
-def _classify_text(text: str, allow_crc_table: bool = False) -> Optional[str]:
+def _classify_text(
+    text: str,
+    allow_crc_table: bool = False,
+    service: str = "cuidador",
+) -> Optional[str]:
     if not text:
         return None
+    service = _normalize_service(service)
     t = _normalize_ocr_text(text)
     has_hev_hint = (
         "REGISTRO DE ACTIVIDADES DE CUIDADO" in t
@@ -586,10 +600,16 @@ def _classify_text(text: str, allow_crc_table: bool = False) -> Optional[str]:
     )
     # Regla de negocio: OPF solo aplica si el texto contiene "ORDEN MEDICA".
     has_opf_phrase = "ORDEN MEDICA" in t or "ORDEN MÉDICA" in t
-    if has_hev_hint:
-        return "HEV"
     if has_opf_phrase:
         return "OPF"
+    if service == "otros_servicios":
+        for cat, patterns in _AUTO_RULES_FIXED:
+            for p in patterns:
+                if p in t:
+                    return cat
+        return "HEV"
+    if has_hev_hint:
+        return "HEV"
     for cat, patterns in _AUTO_RULES_STRONG:
         for p in patterns:
             if p in t:
@@ -678,18 +698,23 @@ def _ocr_page_text(job_id: str, page_index: int, header_only: bool = False) -> s
 
     return text
 
-def _page_text_for_classification(job_id: str, page_index: int, cancel_check: Optional[callable] = None) -> str:
+def _page_text_for_classification(
+    job_id: str,
+    page_index: int,
+    cancel_check: Optional[callable] = None,
+    service: str = "cuidador",
+) -> str:
     if cancel_check and cancel_check():
         raise RuntimeError("batch_cancelled")
     # 1) Texto embebido del PDF (rápido)
     text = _extract_page_text(job_id, page_index)
     if _text_is_useful(text):
-        if _classify_text(text, allow_crc_table=True):
+        if _classify_text(text, allow_crc_table=True, service=service):
             return text
         if cancel_check and cancel_check():
             raise RuntimeError("batch_cancelled")
         header_text = _ocr_page_text(job_id, page_index, header_only=True)
-        if _classify_text(header_text, allow_crc_table=False):
+        if _classify_text(header_text, allow_crc_table=False, service=service):
             return header_text
         return text
 
@@ -697,7 +722,7 @@ def _page_text_for_classification(job_id: str, page_index: int, cancel_check: Op
     if cancel_check and cancel_check():
         raise RuntimeError("batch_cancelled")
     header_text = _ocr_page_text(job_id, page_index, header_only=True)
-    if _classify_text(header_text, allow_crc_table=False):
+    if _classify_text(header_text, allow_crc_table=False, service=service):
         return header_text
 
     # 3) OCR completo (fallback para tablas / scans)
@@ -921,6 +946,7 @@ class BatchCreateResponse(BaseModel):
 
 class BatchUploadUrlRequest(BaseModel):
     filename: str = Field(..., description="Nombre del archivo ZIP")
+    service: Optional[str] = Field(default="cuidador", description="Servicio de tipificación")
 
 
 class BatchUploadUrlResponse(BaseModel):
@@ -931,6 +957,7 @@ class BatchUploadUrlResponse(BaseModel):
 
 class BatchFromGCSRequest(BaseModel):
     gcsPath: str = Field(..., description="Ruta gs://bucket/obj o nombre de objeto")
+    service: Optional[str] = Field(default="cuidador", description="Servicio de tipificación")
 
 
 class CleanupResponse(BaseModel):
@@ -1077,16 +1104,17 @@ def get_ocr_text(job_id: str, page_index: int, refresh: bool = False):
     return Response(content=text or "", media_type="text/plain; charset=utf-8")
 
 
-def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
+def _auto_classify_internal(job_id: str, service: str = "cuidador") -> Dict[str, Optional[Category]]:
     meta = _load_meta(job_id)
     total = meta["totalPages"]
     classifications: Dict[str, Optional[Category]] = {}
+    service = _normalize_service(service)
 
     if not OCR_ENABLED:
         raise HTTPException(status_code=503, detail="OCR deshabilitado en el servidor.")
 
     def _ocr_for_index(idx: int) -> Tuple[int, str]:
-        return idx, _page_text_for_classification(job_id, idx)
+        return idx, _page_text_for_classification(job_id, idx, service=service)
 
     texts: Dict[int, str] = {}
     if OCR_WORKERS > 1 and total > 1:
@@ -1095,12 +1123,12 @@ def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
                 texts[idx] = text
     else:
         for i in range(total):
-            texts[i] = _page_text_for_classification(job_id, i)
+            texts[i] = _page_text_for_classification(job_id, i, service=service)
 
     # Primera pasada: solo reglas fuertes (sin estructura de tabla)
     strong: Dict[int, Optional[str]] = {}
     for i in range(total):
-        strong[i] = _classify_text(texts.get(i, ""), allow_crc_table=False)
+        strong[i] = _classify_text(texts.get(i, ""), allow_crc_table=False, service=service)
 
     # Determinar en qué PDFs hay encabezado CRC real
     page_map: List[List[int]] = meta["page_map"]
@@ -1120,7 +1148,9 @@ def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
             classifications[str(i)] = strong[i]
         else:
             allow_crc = crc_pdf.get(pdf_idx, False)
-            classifications[str(i)] = _classify_text(texts.get(i, ""), allow_crc_table=allow_crc) or "HEV"
+            classifications[str(i)] = (
+                _classify_text(texts.get(i, ""), allow_crc_table=allow_crc, service=service) or "HEV"
+            )
 
     # Propagar clasificación dentro del mismo PDF fuente si existe un encabezado fuerte unico
     for pdf_idx, pages in per_pdf.items():
@@ -1131,7 +1161,7 @@ def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
                 strong_hits.add(cat)
         if len(strong_hits) == 1:
             chosen = next(iter(strong_hits))
-            if chosen in {"FEV", "CRC", "PDE"}:
+            if chosen in {"FEV", "CRC", "PDE", "OPF"}:
                 for p in pages:
                     # Solo propagar a páginas sin encabezado fuerte propio
                     if not strong.get(p):
@@ -1143,22 +1173,29 @@ def _auto_classify_internal(job_id: str) -> Dict[str, Optional[Category]]:
 def _auto_classify_internal_with_cancel(
     job_id: str,
     cancel_check: callable,
+    service: str = "cuidador",
 ) -> Dict[str, Optional[Category]]:
     meta = _load_meta(job_id)
     total = meta["totalPages"]
     classifications: Dict[str, Optional[Category]] = {}
+    service = _normalize_service(service)
 
     if not OCR_ENABLED:
         raise HTTPException(status_code=503, detail="OCR deshabilitado en el servidor.")
 
     texts: Dict[int, str] = {}
     for i in range(total):
-        texts[i] = _page_text_for_classification(job_id, i, cancel_check=cancel_check)
+        texts[i] = _page_text_for_classification(
+            job_id,
+            i,
+            cancel_check=cancel_check,
+            service=service,
+        )
 
     # Primera pasada: solo reglas fuertes (sin estructura de tabla)
     strong: Dict[int, Optional[str]] = {}
     for i in range(total):
-        strong[i] = _classify_text(texts.get(i, ""), allow_crc_table=False)
+        strong[i] = _classify_text(texts.get(i, ""), allow_crc_table=False, service=service)
 
     # Determinar en qué PDFs hay encabezado CRC real
     page_map: List[List[int]] = meta["page_map"]
@@ -1178,7 +1215,9 @@ def _auto_classify_internal_with_cancel(
             classifications[str(i)] = strong[i]
         else:
             allow_crc = crc_pdf.get(pdf_idx, False)
-            classifications[str(i)] = _classify_text(texts.get(i, ""), allow_crc_table=allow_crc) or "HEV"
+            classifications[str(i)] = (
+                _classify_text(texts.get(i, ""), allow_crc_table=allow_crc, service=service) or "HEV"
+            )
 
     # Propagar clasificación dentro del mismo PDF fuente si existe un encabezado fuerte unico
     for pdf_idx, pages in per_pdf.items():
@@ -1189,7 +1228,7 @@ def _auto_classify_internal_with_cancel(
                 strong_hits.add(cat)
         if len(strong_hits) == 1:
             chosen = next(iter(strong_hits))
-            if chosen in {"FEV", "CRC", "PDE"}:
+            if chosen in {"FEV", "CRC", "PDE", "OPF"}:
                 for p in pages:
                     if not strong.get(p):
                         classifications[str(p)] = chosen
@@ -1198,8 +1237,8 @@ def _auto_classify_internal_with_cancel(
 
 
 @app.post("/jobs/{job_id}/auto-classify", response_model=AutoClassifyResponse)
-def auto_classify(job_id: str):
-    classifications = _auto_classify_internal(job_id)
+def auto_classify(job_id: str, service: str = "cuidador"):
+    classifications = _auto_classify_internal(job_id, service=service)
     return AutoClassifyResponse(classifications=classifications, ocrEnabled=OCR_ENABLED)
 
 
@@ -1300,6 +1339,7 @@ def process_job(job_id: str, req: ProcessRequest):
 
 def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> None:
     meta = _load_batch_meta(batch_id)
+    service = _normalize_service(meta.get("service"))
     meta["status"] = "processing"
     _save_batch_meta(batch_id, meta)
 
@@ -1331,6 +1371,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
             classifications = _auto_classify_internal_with_cancel(
                 job_id,
                 cancel_check=lambda: _load_batch_meta(batch_id).get("cancelRequested", False),
+                service=service,
             )
             req = ProcessRequest(classifications=classifications, keepJob=False)
             download_name, zip_bytes = _process_job_bytes(job_id, req)
@@ -1432,8 +1473,13 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
 
 
 def _build_batch_from_zip(
-    batch_id: str, zip_path: str, bdir: str, source_gcs_path: Optional[str] = None
+    batch_id: str,
+    zip_path: str,
+    bdir: str,
+    source_gcs_path: Optional[str] = None,
+    service: str = "cuidador",
 ) -> BatchCreateResponse:
+    service = _normalize_service(service)
     input_dir = os.path.join(bdir, "input")
     os.makedirs(input_dir, exist_ok=True)
 
@@ -1470,6 +1516,7 @@ def _build_batch_from_zip(
 
     meta = {
         "batchId": batch_id,
+        "service": service,
         "createdAt": time.time(),
         "status": "ready",
         "cancelRequested": False,
@@ -1484,7 +1531,11 @@ def _build_batch_from_zip(
 
 
 @app.post("/batch", response_model=BatchCreateResponse)
-async def create_batch(background: BackgroundTasks, file: UploadFile = File(...)):
+async def create_batch(
+    background: BackgroundTasks,
+    file: UploadFile = File(...),
+    service: str = Form("cuidador"),
+):
     if not file.filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Debes subir un archivo .zip")
 
@@ -1496,7 +1547,13 @@ async def create_batch(background: BackgroundTasks, file: UploadFile = File(...)
 
     zip_path = os.path.join(bdir, "batch.zip")
     await _save_upload_file_limited(file, zip_path, MAX_BATCH_BYTES)
-    return _build_batch_from_zip(batch_id, zip_path, bdir, source_gcs_path=None)
+    return _build_batch_from_zip(
+        batch_id,
+        zip_path,
+        bdir,
+        source_gcs_path=None,
+        service=service,
+    )
 
 
 @app.post("/batch/upload-url", response_model=BatchUploadUrlResponse)
@@ -1536,7 +1593,13 @@ def create_batch_from_gcs(req: BatchFromGCSRequest):
     zip_path = os.path.join(bdir, "batch.zip")
     blob.download_to_filename(zip_path)
 
-    resp = _build_batch_from_zip(batch_id, zip_path, bdir, source_gcs_path=req.gcsPath)
+    resp = _build_batch_from_zip(
+        batch_id,
+        zip_path,
+        bdir,
+        source_gcs_path=req.gcsPath,
+        service=req.service or "cuidador",
+    )
     _delete_gcs_object(req.gcsPath)
     try:
         meta = _load_batch_meta(batch_id)
@@ -1552,6 +1615,7 @@ def get_batch(batch_id: str):
     meta = _reconcile_batch_meta(batch_id, _load_batch_meta(batch_id))
     return {
         "batchId": meta.get("batchId"),
+        "service": meta.get("service", "cuidador"),
         "createdAt": meta.get("createdAt"),
         "status": meta.get("status"),
         "cancelRequested": meta.get("cancelRequested", False),

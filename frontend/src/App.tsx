@@ -11,7 +11,7 @@ type DetectError = {
   ocfeDetected?: string | null;
 };
 
-type ServiceId = "cuidador";
+type ServiceId = "cuidador" | "otros_servicios";
 type ModeId = "single" | "batch";
 
 type BatchPackage = {
@@ -66,6 +66,13 @@ const SERVICES: {
     enabled: true,
     desc: "Gestión de documentos para cuidadores domiciliarios.",
     icon: "C",
+  },
+  {
+    id: "otros_servicios",
+    label: "Otros Servicios",
+    enabled: true,
+    desc: "",
+    icon: "O",
   },
   {
     id: "soon",
@@ -137,6 +144,10 @@ export default function App() {
   const [batchRetrying, setBatchRetrying] = useState(false);
   const [batchNotice, setBatchNotice] = useState<string | null>(null);
   const [batchActive, setBatchActive] = useState(false);
+  const serviceLabel = useMemo(() => {
+    if (!service) return "";
+    return service === "cuidador" ? "Cuidador" : "Otros Servicios";
+  }, [service]);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { SIN: 0 };
@@ -303,7 +314,8 @@ export default function App() {
     if (!jobId) return;
     setAutoClassifying(true);
     try {
-      const res = await fetch(`${API_BASE}/jobs/${jobId}/auto-classify`, {
+      const svc = encodeURIComponent(service ?? "cuidador");
+      const res = await fetch(`${API_BASE}/jobs/${jobId}/auto-classify?service=${svc}`, {
         method: "POST",
       });
       if (!res.ok) {
@@ -335,7 +347,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/batch/upload-url`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: file.name }),
+        body: JSON.stringify({ filename: file.name, service: service ?? "cuidador" }),
       });
       if (!res.ok) {
         return null;
@@ -355,7 +367,7 @@ export default function App() {
       const batchRes = await fetch(`${API_BASE}/batch/from-gcs`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ gcsPath: data.gcsPath }),
+        body: JSON.stringify({ gcsPath: data.gcsPath, service: service ?? "cuidador" }),
       });
       if (!batchRes.ok) {
         const t = await batchRes.text();
@@ -376,6 +388,7 @@ export default function App() {
     if (!data) {
       const form = new FormData();
       form.append("file", file);
+      form.append("service", service ?? "cuidador");
 
       const res = await fetch(`${API_BASE}/batch`, {
         method: "POST",
@@ -526,7 +539,7 @@ export default function App() {
           <span className="brandAccent">Cloud</span>
         </div>
         <div className="row headerMeta">
-          {service && <span className="chip chip--info">Servicio: Cuidador</span>}
+          {service && <span className="chip chip--info">Servicio: {serviceLabel}</span>}
           {showWork && (
             <>
               <span className="chip">API: {API_BASE.replace(/^https?:\/\//, "")}</span>
@@ -551,14 +564,14 @@ export default function App() {
                 <button
                   key={`${s.id}-${idx}`}
                   className={`serviceTile ${s.enabled ? "" : "serviceTile--disabled"}`}
-                  onClick={() => s.enabled && selectService("cuidador")}
+                  onClick={() => s.enabled && selectService(s.id as ServiceId)}
                   disabled={!s.enabled}
                 >
                   {s.tag && <span className="serviceBadge">{s.tag}</span>}
                   <div className="serviceIcon">{s.icon}</div>
                   <div className="serviceInfo">
                     <div className="serviceLabel">{s.label}</div>
-                    <div className="serviceDesc">{s.desc}</div>
+                    {s.desc ? <div className="serviceDesc">{s.desc}</div> : null}
                   </div>
                 </button>
               ))}
@@ -574,7 +587,7 @@ export default function App() {
               </button>
               <div className="panelMeta">
                 <span className="chip chip--muted">Modo: Masivo</span>
-                <span className="chip chip--info">Cuidador</span>
+                <span className="chip chip--info">{serviceLabel}</span>
               </div>
             </div>
             <div className="panelTitleRow">
