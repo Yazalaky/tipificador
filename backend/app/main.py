@@ -602,6 +602,9 @@ def _classify_text(
     has_opf_phrase = "ORDEN MEDICA" in t or "ORDEN MÉDICA" in t
     if has_opf_phrase:
         return "OPF"
+    # Excepcion de negocio: "CERTIFICACION DETALLE DE CARGOS" se clasifica como HEV.
+    if "CERTIFICACION DETALLE DE CARGOS" in t or "CERTIFICACION DEL DETALLE DE CARGOS" in t:
+        return "HEV"
     if service == "otros_servicios":
         for cat, patterns in _AUTO_RULES_FIXED:
             for p in patterns:
@@ -614,7 +617,7 @@ def _classify_text(
         for p in patterns:
             if p in t:
                 return cat
-    if _has_crc_table_hint(t):
+    if allow_crc_table and _has_crc_table_hint(t):
         return "CRC"
     return None
 
