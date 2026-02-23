@@ -598,6 +598,9 @@ def _classify_text(
         or "HISTORIA CLÍNICA" in t
         or "TRABAJO SOCIAL" in t
     )
+    # Regla de negocio: historia clinica / trabajo social siempre prevalece sobre OPF.
+    if has_hev_hint:
+        return "HEV"
     # Regla de negocio: OPF solo aplica si el texto contiene "ORDEN MEDICA".
     has_opf_phrase = "ORDEN MEDICA" in t or "ORDEN MÉDICA" in t
     if has_opf_phrase:
@@ -610,8 +613,6 @@ def _classify_text(
             for p in patterns:
                 if p in t:
                     return cat
-        return "HEV"
-    if has_hev_hint:
         return "HEV"
     for cat, patterns in _AUTO_RULES_STRONG:
         for p in patterns:
