@@ -51,6 +51,7 @@ OCR_HEADER_DPI = int(os.environ.get("TIPIFICADOR_OCR_HEADER_DPI", str(min(200, O
 OCR_MIN_TEXT_LEN = int(os.environ.get("TIPIFICADOR_OCR_MIN_TEXT_LEN", "40"))
 OCR_KEEP_IMAGES = os.environ.get("TIPIFICADOR_OCR_KEEP_IMAGES", "0").lower() in {"1", "true", "yes"}
 OCR_WORKERS = int(os.environ.get("TIPIFICADOR_OCR_WORKERS", "4"))
+PDF_REWRITE_ENABLED = os.environ.get("TIPIFICADOR_PDF_REWRITE_ENABLED", "1").lower() not in {"0", "false", "no"}
 MAX_BATCH_PACKAGES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_PACKAGES", "10"))
 MAX_BATCH_BYTES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_BYTES", "524288000"))  # 500MB
 GCS_BUCKET = os.environ.get("TIPIFICADOR_GCS_BUCKET", "").strip()
@@ -431,6 +432,36 @@ def _collect_pdf_paths(root: str) -> List[str]:
     return sorted(pdfs)
 
 
+def _rewrite_pdf_structure_inplace(path: str) -> None:
+    """
+    Reescribe el PDF para normalizar estructura interna (xref/objetos).
+    Esto reduce errores de insercion de paginas en lotes con PDFs escaneados.
+    """
+    if not PDF_REWRITE_ENABLED:
+        return
+    tmp_path = f"{path}.normalized.pdf"
+    doc: Optional[fitz.Document] = None
+    try:
+        doc = fitz.open(path)
+        doc.save(tmp_path, garbage=4, deflate=True, clean=True)
+        doc.close()
+        doc = None
+        # Validar que el PDF normalizado abre correctamente antes de reemplazar.
+        check = fitz.open(tmp_path)
+        check.close()
+        os.replace(tmp_path, path)
+    except Exception:
+        # Fallback seguro: conservar original si falla la normalizacion.
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+    finally:
+        if doc is not None:
+            doc.close()
+
+
 def _create_job_from_pdf_paths(pdf_paths: List[str]) -> Tuple[str, int]:
     if not pdf_paths:
         raise HTTPException(status_code=400, detail="Paquete sin PDFs.")
@@ -455,6 +486,7 @@ def _create_job_from_pdf_paths(pdf_paths: List[str]) -> Tuple[str, int]:
 
             src_path = os.path.join(jdir, "pdfs", f"src_{i}.pdf")
             shutil.copyfile(path, src_path)
+            _rewrite_pdf_structure_inplace(src_path)
 
             try:
                 doc = fitz.open(src_path)
@@ -650,12 +682,16 @@ def _classify_text(
         return None
     service = _normalize_service(service)
     t = _normalize_ocr_text(text)
+    has_opf_decisiones = bool(re.search(r"\bORDEN\s+MEDICA\s*\(?DECISIONES\)?\b", t))
     has_hev_social_hint = (
         "REGISTRO DE ACTIVIDADES DE CUIDADO" in t
         or "REGISTRO DE ACTIVIDADES DE CUIDADOR" in t
         or "TRABAJO SOCIAL" in t
     )
     has_historia_hint = "HISTORIA CLINICA" in t or "HISTORIA CLÍNICA" in t
+    # Regla de negocio: "ORDEN MEDICA (DECISIONES)" siempre va a OPF.
+    if has_opf_decisiones:
+        return "OPF"
     if has_hev_social_hint:
         return "HEV"
     # Excepcion de negocio: "CERTIFICACION DETALLE DE CARGOS" se clasifica como HEV.
@@ -1086,6 +1122,7 @@ async def create_job(files: List[UploadFile] = File(...)):
 
             src_path = os.path.join(jdir, "pdfs", f"src_{i}.pdf")
             await _save_upload_file_limited(uf, src_path, MAX_FILE_BYTES)
+            _rewrite_pdf_structure_inplace(src_path)
 
             try:
                 doc = fitz.open(src_path)
