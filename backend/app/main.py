@@ -610,6 +610,37 @@ def _looks_like_otros_servicios_pde(t: str) -> bool:
     return has_order_number and signals >= 2
 
 
+def _looks_like_otros_servicios_crc_terapias(t: str) -> bool:
+    if not t:
+        return False
+
+    cleaned = re.sub(r"[^A-Z0-9 ]+", " ", t)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    has_registro_individual = bool(re.search(r"REGISTR[O0]\s+INDIVID", cleaned))
+    has_prestacion_servicios = "PRESTAC" in cleaned and "SERVICI" in cleaned
+    has_terapia_context = "TERAPI" in cleaned or "APOYO TERAPEUT" in cleaned
+    has_terapia_fields = "TIPO DE TERAPIA" in cleaned or "GAT REH" in cleaned
+    has_control_table = (
+        "SESION" in cleaned
+        and "FIRMA" in cleaned
+        and ("DOCUMENTO" in cleaned or "N DOCUMENTO" in cleaned or "NRO DOCUMENTO" in cleaned)
+    )
+
+    score = sum(
+        [
+            1 if has_registro_individual else 0,
+            1 if has_prestacion_servicios else 0,
+            1 if has_terapia_context else 0,
+            1 if has_terapia_fields else 0,
+            1 if has_control_table else 0,
+        ]
+    )
+    if has_registro_individual and has_terapia_context and (has_prestacion_servicios or has_control_table):
+        return True
+    return has_terapia_context and score >= 3
+
+
 def _classify_text(
     text: str,
     allow_crc_table: bool = False,
@@ -646,6 +677,8 @@ def _classify_text(
     if has_historia_hint:
         return "HEV"
     if service == "otros_servicios":
+        if _looks_like_otros_servicios_crc_terapias(t):
+            return "CRC"
         for cat, patterns in _AUTO_RULES_FIXED:
             for p in patterns:
                 if p in t:
