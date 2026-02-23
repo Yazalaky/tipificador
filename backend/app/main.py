@@ -582,6 +582,34 @@ def _has_crc_table_hint(text: str) -> bool:
     return fallback_headers or fallback_rows
 
 
+def _looks_like_otros_servicios_pde(t: str) -> bool:
+    if not t:
+        return False
+    has_order_number = (
+        "NUMERO DE ORDEN" in t
+        or "NUMERO ORDEN" in t
+        or "NRO DE ORDEN" in t
+        or "NO. ORDEN" in t
+    )
+    has_fomag_header = "FOMAG" in t or "FONDO NACIONAL DE PRESTACIONES SOCIALES DEL MAGISTERIO" in t
+    has_provider_block = "NOMBRE PRESTADOR" in t and ("COD HABILITACION" in t or "DIAGNOSTICO DX" in t)
+    has_signature_block = (
+        ("FIRMA DEL MEDICO QUE ORDENA" in t and "FIRMA DEL USUARIO" in t)
+        or "FIRMA DE QUIEN TRANSCRIBE" in t
+    )
+    has_network_fields = "IPS PRIMARIA" in t or "GESTION DE RED" in t
+
+    signals = sum(
+        [
+            1 if has_fomag_header else 0,
+            1 if has_provider_block else 0,
+            1 if has_signature_block else 0,
+            1 if has_network_fields else 0,
+        ]
+    )
+    return has_order_number and signals >= 2
+
+
 def _classify_text(
     text: str,
     allow_crc_table: bool = False,
@@ -591,28 +619,39 @@ def _classify_text(
         return None
     service = _normalize_service(service)
     t = _normalize_ocr_text(text)
-    has_hev_hint = (
+    has_hev_social_hint = (
         "REGISTRO DE ACTIVIDADES DE CUIDADO" in t
         or "REGISTRO DE ACTIVIDADES DE CUIDADOR" in t
-        or "HISTORIA CLINICA" in t
-        or "HISTORIA CLÍNICA" in t
         or "TRABAJO SOCIAL" in t
     )
-    # Regla de negocio: historia clinica / trabajo social siempre prevalece sobre OPF.
-    if has_hev_hint:
+    has_historia_hint = "HISTORIA CLINICA" in t or "HISTORIA CLÍNICA" in t
+    if has_hev_social_hint:
+        return "HEV"
+    # Excepcion de negocio: "CERTIFICACION DETALLE DE CARGOS" se clasifica como HEV.
+    if "CERTIFICACION DETALLE DE CARGOS" in t or "CERTIFICACION DEL DETALLE DE CARGOS" in t:
         return "HEV"
     # Regla de negocio: OPF solo aplica si el texto contiene "ORDEN MEDICA".
     has_opf_phrase = "ORDEN MEDICA" in t or "ORDEN MÉDICA" in t
+    opf_context = (
+        "ORDEN MEDICA (DECISIONES)" in t
+        or "ORDEN MÉDICA (DECISIONES)" in t
+        or "DIAGNOSTICO PRINCIPAL" in t
+        or "DIAGNOSTICOS SECUNDARIOS" in t
+        or "MES INICIO" in t
+    )
     if has_opf_phrase:
+        if has_historia_hint and not opf_context:
+            return "HEV"
         return "OPF"
-    # Excepcion de negocio: "CERTIFICACION DETALLE DE CARGOS" se clasifica como HEV.
-    if "CERTIFICACION DETALLE DE CARGOS" in t or "CERTIFICACION DEL DETALLE DE CARGOS" in t:
+    if has_historia_hint:
         return "HEV"
     if service == "otros_servicios":
         for cat, patterns in _AUTO_RULES_FIXED:
             for p in patterns:
                 if p in t:
                     return cat
+        if _looks_like_otros_servicios_pde(t):
+            return "PDE"
         return "HEV"
     for cat, patterns in _AUTO_RULES_STRONG:
         for p in patterns:
