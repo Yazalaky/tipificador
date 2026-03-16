@@ -997,6 +997,21 @@ def _open_source_pdf(job_id: str, pdf_idx: int) -> fitz.Document:
     return fitz.open(path)
 
 
+def _append_page_with_fallback(out: fitz.Document, src_doc: fitz.Document, page_idx: int) -> None:
+    try:
+        out.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
+        return
+    except Exception:
+        pass
+
+    # Fallback: rasteriza la pagina para evitar errores de estructura interna del PDF fuente.
+    page = src_doc.load_page(page_idx)
+    rect = page.rect
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+    out_page = out.new_page(width=rect.width, height=rect.height)
+    out_page.insert_image(rect, stream=pix.tobytes("png"))
+
+
 def _build_pdf_from_global_pages(job_id: str, global_pages: List[int]) -> fitz.Document:
     meta = _load_meta(job_id)
     mapping: List[List[int]] = meta["page_map"]  # [[pdf_idx, page_idx], ...]
@@ -1010,7 +1025,7 @@ def _build_pdf_from_global_pages(job_id: str, global_pages: List[int]) -> fitz.D
             pdf_idx, page_idx = mapping[g]
             if pdf_idx not in src_docs:
                 src_docs[pdf_idx] = _open_source_pdf(job_id, pdf_idx)
-            out.insert_pdf(src_docs[pdf_idx], from_page=page_idx, to_page=page_idx)
+            _append_page_with_fallback(out, src_docs[pdf_idx], page_idx)
     finally:
         for doc in src_docs.values():
             doc.close()
