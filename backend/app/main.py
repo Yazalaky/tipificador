@@ -710,6 +710,46 @@ def _looks_like_otros_servicios_crc_terapias(t: str) -> bool:
     return has_terapia_context and score >= 3
 
 
+def _looks_like_otros_servicios_crc_medicamentos(t: str) -> bool:
+    if not t:
+        return False
+
+    has_med_admin_header = "ADMINISTRACION DE MEDICAMENTOS" in t
+    has_patient_block = (
+        "DOCUMENTO" in t
+        and "NOMBRE" in t
+        and ("TIPO DE USUARIO" in t or "ERP" in t or "FECHA DE NACIMIENTO" in t)
+    )
+    has_med_table = (
+        "FECHA" in t
+        and "HORA" in t
+        and "MEDICAMENTO" in t
+        and "DOSIS" in t
+        and "FRECUENCIA" in t
+    )
+    has_pharma_context = (
+        "FORMA FARMACEUTICA" in t
+        or "VIA" in t
+        or "VIA INTRAVENOSA" in t
+        or "VIA INTRAMUSCULAR" in t
+    )
+    has_execution_trace = (
+        "PRESTO EL SERVICIO" in t
+        or "PRESTÓ EL SERVICIO" in t
+        or ("N." in t and "FIRMA" in t)
+    )
+
+    signals = sum(
+        [
+            1 if has_patient_block else 0,
+            1 if has_med_table else 0,
+            1 if has_pharma_context else 0,
+            1 if has_execution_trace else 0,
+        ]
+    )
+    return has_med_admin_header and signals >= 2
+
+
 def _classify_text(
     text: str,
     allow_crc_table: bool = False,
@@ -750,7 +790,7 @@ def _classify_text(
     if has_historia_hint:
         return "HEV"
     if service == "otros_servicios":
-        if _looks_like_otros_servicios_crc_terapias(t):
+        if _looks_like_otros_servicios_crc_terapias(t) or _looks_like_otros_servicios_crc_medicamentos(t):
             return "CRC"
         for cat, patterns in _AUTO_RULES_FIXED:
             for p in patterns:
