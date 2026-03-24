@@ -617,6 +617,10 @@ def _has_crc_table_hint(text: str) -> bool:
 def _looks_like_otros_servicios_pde(t: str) -> bool:
     if not t:
         return False
+    has_authorization_header = (
+        "AUTORIZACION DE SERVICIOS" in t
+        or "AUTORIZACION SERVICIOS" in t
+    )
     has_order_number = (
         "NUMERO DE ORDEN" in t
         or "NUMERO ORDEN" in t
@@ -630,6 +634,27 @@ def _looks_like_otros_servicios_pde(t: str) -> bool:
         or "FIRMA DE QUIEN TRANSCRIBE" in t
     )
     has_network_fields = "IPS PRIMARIA" in t or "GESTION DE RED" in t
+    has_authorization_metadata = (
+        "NO. SOLICITUD" in t
+        or "NO. AUTORIZACION" in t
+        or "CODIGO EPS" in t
+    )
+    has_patient_context = (
+        "AFILIADO" in t
+        or "UBICACION DEL PACIENTE" in t
+        or "DX:" in t
+        or "DX " in t
+    )
+    has_request_flow = (
+        "SOLICITADO POR" in t
+        or "ORDENADO POR" in t
+        or "REMITIDO A" in t
+    )
+    has_service_table = (
+        "CODIGO" in t
+        and "DESCRIPCION" in t
+        and ("CANT" in t or "CANTIDAD" in t)
+    )
 
     signals = sum(
         [
@@ -639,6 +664,18 @@ def _looks_like_otros_servicios_pde(t: str) -> bool:
             1 if has_network_fields else 0,
         ]
     )
+    authorization_signals = sum(
+        [
+            1 if has_authorization_metadata else 0,
+            1 if has_patient_context else 0,
+            1 if has_request_flow else 0,
+            1 if has_service_table else 0,
+        ]
+    )
+
+    if has_authorization_header and authorization_signals >= 2:
+        return True
+
     return has_order_number and signals >= 2
 
 
