@@ -18,7 +18,7 @@ bash scripts/bootstrap_dev.sh
 ## 2) Levantar backend
 
 ```bash
-cd /home/sistemas/Proyectos/tipificador-cloud/backend
+cd /home/sistemas/projects/tipificador/backend
 source .venv/bin/activate
 uvicorn app.main:app --reload --port 8000
 ```
@@ -30,18 +30,24 @@ API local: `http://127.0.0.1:8000`
 En otra terminal:
 
 ```bash
-cd /home/sistemas/Proyectos/tipificador-cloud/frontend
+cd /home/sistemas/projects/tipificador/frontend
+printf 'VITE_API_BASE=http://127.0.0.1:8000\n' > .env.local
 npm run dev
 ```
 
 Frontend local: `http://127.0.0.1:5173`
 
-## 4) Problemas comunes
+## 4) Flujos disponibles en local
+
+- Flujo individual: crear `job`, clasificar paginas y ejecutar `POST /jobs/{id}/process`.
+- Flujo por lotes: cargar paquetes y procesarlos mediante endpoints `/batch`.
+- Auto-clasificacion: disponible desde `POST /jobs/{id}/auto-classify`.
+
+## 5) Problemas comunes
 
 - `ModuleNotFoundError: No module named 'google'`:
   - Ejecutar `pip install -r backend/requirements.txt` dentro de `.venv`.
 - `No such file or directory: tesseract`:
   - Instalar tesseract e idioma espanol en el sistema.
 - CORS en local:
-  - Validar que frontend apunte al backend local (`VITE_API_BASE=http://localhost:8000`).
-
+  - Validar que frontend apunte al backend local (`VITE_API_BASE=http://127.0.0.1:8000`).

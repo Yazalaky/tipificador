@@ -4,8 +4,8 @@ Aplicacion para tipificar soportes PDF de facturacion domiciliaria y generar ZIP
 
 ## Estructura
 
-- `backend/`: API FastAPI (OCR, clasificacion, procesamiento de ZIP).
-- `frontend/`: UI React + Vite.
+- `backend/`: API FastAPI, OCR, clasificacion y generacion de ZIP/ZIPs por lote.
+- `frontend/`: UI React + Vite para flujo individual y por lotes.
 - `tools/`: scripts de deploy y mantenimiento.
 - `scripts/`: utilidades de bootstrap para entorno nuevo.
 - `CONTEXT.md`: reglas funcionales del negocio.
@@ -23,3 +23,8 @@ Aplicacion para tipificar soportes PDF de facturacion domiciliaria y generar ZIP
 2. Ejecutar `scripts/bootstrap_dev.sh`.
 3. Levantar backend y frontend siguiendo `RUN_LOCAL.md`.
 
+## Alcance actual
+
+- Flujo individual: subir PDFs, tipificar paginas y procesar un ZIP final.
+- Flujo por lotes: subir paquetes, procesarlos en segundo plano y descargar resultados por paquete o consolidados.
+- Auto-clasificacion y OCR de apoyo expuestos desde el backend.
