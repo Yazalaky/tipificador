@@ -39,7 +39,7 @@ THUMB_WIDTH = 240
 VIEW_WIDTH = 1100
 
 MAX_FILE_BYTES = int(os.environ.get("TIPIFICADOR_MAX_FILE_BYTES", "104857600"))  # 100MB
-MAX_FILES = int(os.environ.get("TIPIFICADOR_MAX_FILES", "20"))
+MAX_FILES = int(os.environ.get("TIPIFICADOR_MAX_FILES", "80"))
 JOB_TTL_SECONDS = int(os.environ.get("TIPIFICADOR_JOB_TTL_SECONDS", "21600"))  # 6 hours
 CACHE_VIEW = os.environ.get("TIPIFICADOR_CACHE_VIEW", "1").lower() not in {"0", "false", "no"}
 OCR_ENABLED = os.environ.get("TIPIFICADOR_OCR_ENABLED", "1").lower() not in {"0", "false", "no"}
@@ -52,7 +52,7 @@ OCR_MIN_TEXT_LEN = int(os.environ.get("TIPIFICADOR_OCR_MIN_TEXT_LEN", "40"))
 OCR_KEEP_IMAGES = os.environ.get("TIPIFICADOR_OCR_KEEP_IMAGES", "0").lower() in {"1", "true", "yes"}
 OCR_WORKERS = int(os.environ.get("TIPIFICADOR_OCR_WORKERS", "4"))
 PDF_REWRITE_ENABLED = os.environ.get("TIPIFICADOR_PDF_REWRITE_ENABLED", "1").lower() not in {"0", "false", "no"}
-MAX_BATCH_PACKAGES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_PACKAGES", "10"))
+MAX_BATCH_PACKAGES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_PACKAGES", "20"))
 MAX_BATCH_BYTES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_BYTES", "524288000"))  # 500MB
 GCS_BUCKET = os.environ.get("TIPIFICADOR_GCS_BUCKET", "").strip()
 GCS_UPLOAD_PREFIX = os.environ.get("TIPIFICADOR_GCS_UPLOAD_PREFIX", "uploads/").strip()

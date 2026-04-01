@@ -556,7 +556,8 @@ export default function App() {
               <ul>
                 <li>Formato aceptado: ZIP únicamente.</li>
                 <li>Estructura interna: ZIP → carpeta → PDFs.</li>
-                <li>Máximo 10 paquetes por carga.</li>
+                <li>Máximo 20 paquetes por carga.</li>
+                <li>Máximo 80 PDFs por paquete.</li>
               </ul>
             </div>
 
