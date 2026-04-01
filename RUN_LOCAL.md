@@ -18,7 +18,7 @@ bash scripts/bootstrap_dev.sh
 ## 2) Levantar backend
 
 ```bash
-cd /home/sistemas/projects/tipificador/backend
+cd backend
 source .venv/bin/activate
 uvicorn app.main:app --reload --port 8000
 ```
@@ -30,12 +30,18 @@ API local: `http://127.0.0.1:8000`
 En otra terminal:
 
 ```bash
-cd /home/sistemas/projects/tipificador/frontend
-printf 'VITE_API_BASE=http://127.0.0.1:8000\n' > .env.local
+cd frontend
+cp .env.example .env.local
 npm run dev
 ```
 
 Frontend local: `http://127.0.0.1:5173`
+
+Variable esperada en `frontend/.env.local`:
+
+```env
+VITE_API_BASE=http://127.0.0.1:8000
+```
 
 ## 4) Flujos disponibles en local
 
