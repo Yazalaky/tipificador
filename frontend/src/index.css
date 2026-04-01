@@ -149,12 +149,14 @@ select {
 .serviceTile {
   position: relative;
   border-radius: 18px;
-  padding: 18px;
+  padding: 24px 18px;
   border: 1px solid rgba(15, 23, 42, 0.08);
   background: #ffffff;
-  text-align: left;
+  text-align: center;
   display: grid;
-  gap: 12px;
+  justify-items: center;
+  align-content: center;
+  gap: 14px;
   min-height: 150px;
   transition: transform 120ms ease, box-shadow 120ms ease;
 }
@@ -183,8 +185,9 @@ select {
 }
 
 .serviceLabel {
-  font-weight: 600;
-  font-size: 16px;
+  font-weight: 700;
+  font-size: 18px;
+  line-height: 1.2;
 }
 
 .serviceDesc {
@@ -194,6 +197,7 @@ select {
 
 .serviceInfo {
   display: grid;
+  justify-items: center;
   gap: 6px;
 }
 

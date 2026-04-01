@@ -53,66 +53,22 @@ function formatBatchError(err: BatchPackage["error"]) {
 }
 
 const SERVICES: {
-  id: ServiceId | "soon";
+  id: ServiceId;
   label: string;
-  enabled: boolean;
   desc: string;
-  tag?: string;
   icon: string;
 }[] = [
   {
     id: "cuidador",
     label: "Cuidador",
-    enabled: true,
-    desc: "Gestión de documentos para cuidadores domiciliarios.",
+    desc: "",
     icon: "C",
   },
   {
     id: "otros_servicios",
     label: "Otros Servicios",
-    enabled: true,
     desc: "",
     icon: "O",
-  },
-  {
-    id: "soon",
-    label: "Enfermería",
-    enabled: false,
-    desc: "Procesamiento de reportes clínicos y evoluciones.",
-    tag: "Próximamente",
-    icon: "E",
-  },
-  {
-    id: "soon",
-    label: "Terapia Física",
-    enabled: false,
-    desc: "Bitácoras de rehabilitación y seguimiento.",
-    tag: "Próximamente",
-    icon: "T",
-  },
-  {
-    id: "soon",
-    label: "Administrativo",
-    enabled: false,
-    desc: "Facturación y documentos legales.",
-    tag: "Próximamente",
-    icon: "A",
-  },
-  {
-    id: "soon",
-    label: "Auditoría",
-    enabled: false,
-    desc: "Revisión de calidad y conformidad.",
-    tag: "Próximamente",
-    icon: "U",
-  },
-  {
-    id: "soon",
-    label: "Laboratorio",
-    enabled: false,
-    desc: "Resultados y órdenes médicas.",
-    tag: "Próximamente",
-    icon: "L",
   },
 ];
 
@@ -563,11 +519,9 @@ export default function App() {
               {SERVICES.map((s, idx) => (
                 <button
                   key={`${s.id}-${idx}`}
-                  className={`serviceTile ${s.enabled ? "" : "serviceTile--disabled"}`}
-                  onClick={() => s.enabled && selectService(s.id as ServiceId)}
-                  disabled={!s.enabled}
+                  className="serviceTile"
+                  onClick={() => selectService(s.id)}
                 >
-                  {s.tag && <span className="serviceBadge">{s.tag}</span>}
                   <div className="serviceIcon">{s.icon}</div>
                   <div className="serviceInfo">
                     <div className="serviceLabel">{s.label}</div>
