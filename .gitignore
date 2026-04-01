@@ -5,6 +5,9 @@
 
 # Python
 backend/.venv/
+backend/.env
+backend/.env.*
+!backend/.env.example
 backend/__pycache__/
 backend/**/*.pyc
 

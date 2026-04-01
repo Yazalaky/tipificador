@@ -19,6 +19,10 @@ bash scripts/bootstrap_dev.sh
 
 ```bash
 cd backend
+cp .env.example .env.local
+set -a
+source .env.local
+set +a
 source .venv/bin/activate
 uvicorn app.main:app --reload --port 8000
 ```
