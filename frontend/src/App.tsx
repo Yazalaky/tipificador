@@ -118,6 +118,13 @@ export default function App() {
 
   const hasFEV = counts["FEV"] > 0;
   const hasJob = Boolean(jobId && totalPages > 0);
+  const batchStatusRef = useRef<string | null>(null);
+  const batchPackagesRef = useRef<BatchPackage[]>([]);
+
+  React.useEffect(() => {
+    batchStatusRef.current = batchStatus;
+    batchPackagesRef.current = batchPackages;
+  }, [batchStatus, batchPackages]);
 
   function resetJobState() {
     setJobId(null);
@@ -375,6 +382,15 @@ export default function App() {
         cache: "no-store",
       });
       if (!res.ok) {
+        if (res.status === 404) {
+          const knownStatus = inferBatchStatus(batchStatusRef.current, batchPackagesRef.current);
+          if (knownStatus && ["done", "partial", "error", "cancelled"].includes(knownStatus)) {
+            return knownStatus;
+          }
+          setBatchActive(false);
+          setBatchNotice("No se pudo seguir consultando el lote. Recarga la página o intenta de nuevo.");
+          return "missing";
+        }
         return null;
       }
       const data = await res.json();
@@ -447,6 +463,9 @@ export default function App() {
       const status = await refreshBatch();
       if (!status) {
         timer = window.setTimeout(tick, 3000);
+        return;
+      }
+      if (status === "missing") {
         return;
       }
       if (status === "cancelled") {

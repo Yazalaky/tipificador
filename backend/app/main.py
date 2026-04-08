@@ -156,9 +156,51 @@ def _batch_meta_path(batch_id: str) -> str:
     return os.path.join(_batch_dir(batch_id), "meta.json")
 
 
+def _batch_meta_object_name(batch_id: str) -> str:
+    return f"{_normalize_prefix(GCS_RESULTS_PREFIX)}{batch_id}/meta.json"
+
+
+def _load_batch_meta_from_gcs(batch_id: str) -> Optional[dict]:
+    if not _gcs_enabled():
+        return None
+    try:
+        client = _gcs_client()
+        bucket = client.bucket(GCS_BUCKET)
+        blob = bucket.blob(_batch_meta_object_name(batch_id))
+        if not blob.exists():
+            return None
+        data = blob.download_as_text(encoding="utf-8")
+        meta = json.loads(data)
+        os.makedirs(_batch_dir(batch_id), exist_ok=True)
+        with open(_batch_meta_path(batch_id), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        return meta
+    except Exception:
+        return None
+
+
+def _save_batch_meta_to_gcs(batch_id: str, meta: dict) -> None:
+    if not _gcs_enabled():
+        return
+    try:
+        client = _gcs_client()
+        bucket = client.bucket(GCS_BUCKET)
+        blob = bucket.blob(_batch_meta_object_name(batch_id))
+        blob.upload_from_string(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            content_type="application/json; charset=utf-8",
+        )
+    except Exception:
+        # Best-effort mirror for Cloud Run instance hopping.
+        return
+
+
 def _load_batch_meta(batch_id: str) -> dict:
     path = _batch_meta_path(batch_id)
     if not os.path.exists(path):
+        meta = _load_batch_meta_from_gcs(batch_id)
+        if meta is not None:
+            return meta
         raise HTTPException(status_code=404, detail="Batch no existe o expiró.")
     for _ in range(3):
         try:
@@ -166,17 +208,22 @@ def _load_batch_meta(batch_id: str) -> dict:
                 return json.load(f)
         except json.JSONDecodeError:
             time.sleep(0.05)
+    meta = _load_batch_meta_from_gcs(batch_id)
+    if meta is not None:
+        return meta
     raise HTTPException(status_code=503, detail="Batch temporalmente ocupado, intenta de nuevo.")
 
 
 def _save_batch_meta(batch_id: str, meta: dict) -> None:
     path = _batch_meta_path(batch_id)
+    os.makedirs(_batch_dir(batch_id), exist_ok=True)
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
+    _save_batch_meta_to_gcs(batch_id, meta)
 
 
 def _gcs_enabled() -> bool:
