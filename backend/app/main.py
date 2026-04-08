@@ -797,6 +797,104 @@ def _looks_like_otros_servicios_crc_medicamentos(t: str) -> bool:
     return has_med_admin_header and signals >= 2
 
 
+def _looks_like_otros_servicios_crc_signos_vitales_header(t: str) -> bool:
+    if not t:
+        return False
+
+    has_header = (
+        "REGISTRO SIGNOS VITALES" in t
+        or "REGISTRO DE SIGNOS VITALES" in t
+    )
+    has_patient_block = (
+        "DOCUMENTO" in t
+        and "NOMBRE" in t
+        and ("ERP" in t or "REGIMEN CONTRIBUTIVO" in t or "REGIMEN SUBSIDIADO" in t)
+    )
+    has_datetime_columns = "FECHA" in t and "HORA" in t
+    has_pressure_block = (
+        "TA" in t
+        and "SISTOLICA" in t
+        and "DIASTOLICA" in t
+    )
+    has_vital_signs_columns = sum(
+        [
+            1 if "F.C" in t or "FC" in t else 0,
+            1 if "F.R" in t or "FR" in t else 0,
+            1 if "SPO2" in t else 0,
+            1 if "GLUCOMETRIA" in t else 0,
+            1 if "T " in t or " T." in t or " T°" in t else 0,
+        ]
+    ) >= 3
+    has_sampling_context = "LUGAR DE TOMA" in t or "MSD BRAZO" in t or "MSI BRAZO" in t
+
+    score = sum(
+        [
+            1 if has_header else 0,
+            1 if has_patient_block else 0,
+            1 if has_datetime_columns else 0,
+            1 if has_pressure_block else 0,
+            1 if has_vital_signs_columns else 0,
+            1 if has_sampling_context else 0,
+        ]
+    )
+
+    if has_header and has_datetime_columns and has_pressure_block and has_vital_signs_columns:
+        return True
+    return score >= 5
+
+
+def _looks_like_otros_servicios_crc_signos_vitales_continuation(t: str) -> bool:
+    if not t:
+        return False
+
+    has_no_column = "NO." in t or "NO " in t or " N0 " in t or "NO\t" in t
+    has_table_columns = (
+        "FECHA" in t
+        and "HORA" in t
+        and "LUGAR DE TOMA" in t
+    )
+    has_pressure_block = "SISTOLICA" in t and "DIASTOLICA" in t
+    has_vital_signs_columns = sum(
+        [
+            1 if "F.C" in t or "FC" in t else 0,
+            1 if "F.R" in t or "FR" in t else 0,
+            1 if "SPO2" in t else 0,
+            1 if "GLUCOMETRIA" in t else 0,
+            1 if "T " in t or " T." in t or " T°" in t else 0,
+        ]
+    ) >= 3
+    has_measurement_context = (
+        "MSD BRAZO" in t
+        or "MSI BRAZO" in t
+        or "BRAZO DERECHO" in t
+        or "BRAZO IZQUIERDO" in t
+        or "CONVENCIONES" in t
+    )
+    has_sequence_rows = bool(
+        re.search(r"\b(?:[1-9]|[1-4][0-9]|5[0-9])\b", t)
+    )
+
+    score = sum(
+        [
+            1 if has_no_column else 0,
+            1 if has_table_columns else 0,
+            1 if has_pressure_block else 0,
+            1 if has_vital_signs_columns else 0,
+            1 if has_measurement_context else 0,
+            1 if has_sequence_rows else 0,
+        ]
+    )
+
+    return has_table_columns and has_pressure_block and has_vital_signs_columns and score >= 5
+
+
+def _looks_like_otros_servicios_crc_signos_vitales(t: str) -> bool:
+    return (
+        _looks_like_otros_servicios_crc_signos_vitales_header(t)
+        or _looks_like_otros_servicios_crc_signos_vitales_continuation(t)
+    )
+
+
 def _classify_text(
     text: str,
     allow_crc_table: bool = False,
@@ -837,7 +935,11 @@ def _classify_text(
     if has_historia_hint:
         return "HEV"
     if service == "otros_servicios":
-        if _looks_like_otros_servicios_crc_terapias(t) or _looks_like_otros_servicios_crc_medicamentos(t):
+        if (
+            _looks_like_otros_servicios_crc_terapias(t)
+            or _looks_like_otros_servicios_crc_medicamentos(t)
+            or _looks_like_otros_servicios_crc_signos_vitales(t)
+        ):
             return "CRC"
         for cat, patterns in _AUTO_RULES_FIXED:
             for p in patterns:
