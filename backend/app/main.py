@@ -757,7 +757,7 @@ def _looks_like_otros_servicios_crc_terapias(t: str) -> bool:
     return has_terapia_context and score >= 3
 
 
-def _looks_like_otros_servicios_crc_medicamentos(t: str) -> bool:
+def _looks_like_otros_servicios_crc_medicamentos_header(t: str) -> bool:
     if not t:
         return False
 
@@ -795,6 +795,95 @@ def _looks_like_otros_servicios_crc_medicamentos(t: str) -> bool:
         ]
     )
     return has_med_admin_header and signals >= 2
+
+
+def _looks_like_otros_servicios_crc_medicamentos_continuation(t: str) -> bool:
+    if not t:
+        return False
+
+    has_sequence_column = "N." in t or "NO." in t or "NO " in t or "NO\t" in t
+    has_datetime_columns = "FECHA" in t and "HORA" in t
+    has_med_table = (
+        "MEDICAMENTO" in t
+        and "FORMA FARMACEUTICA" in t
+        and "DOSIS" in t
+        and "FRECUENCIA" in t
+    )
+    has_route_and_execution = (
+        "VIA" in t
+        and ("PRESTO EL SERVICIO" in t or "PRESTÓ EL SERVICIO" in t)
+    )
+    has_admin_context = (
+        "SONDA DE GASTROSTOMIA" in t
+        or "CAPSULA" in t
+        or "CAPSULA BLANDA" in t
+        or "TABLETAS" in t
+        or "PASTA" in t
+        or "OTRAS SOLUCIONES" in t
+        or "MG" in t
+        or "ML" in t
+        or "GOTAS" in t
+    )
+    has_sequence_rows = bool(
+        re.search(r"\b(?:[1-9]|[1-4][0-9]|5[0-9])\b", t)
+    )
+
+    score = sum(
+        [
+            1 if has_sequence_column else 0,
+            1 if has_datetime_columns else 0,
+            1 if has_med_table else 0,
+            1 if has_route_and_execution else 0,
+            1 if has_admin_context else 0,
+            1 if has_sequence_rows else 0,
+        ]
+    )
+
+    return has_datetime_columns and has_med_table and has_route_and_execution and score >= 5
+
+
+def _looks_like_otros_servicios_crc_medicamentos(t: str) -> bool:
+    return (
+        _looks_like_otros_servicios_crc_medicamentos_header(t)
+        or _looks_like_otros_servicios_crc_medicamentos_continuation(t)
+    )
+
+
+def _looks_like_otros_servicios_hev_nota_enfermeria(t: str) -> bool:
+    if not t:
+        return False
+
+    has_header = "NOTA DE ENFERMERIA" in t
+    has_sequence_column = "N." in t or "NO." in t or "NO " in t or "NO\t" in t
+    has_datetime_columns = "FECHA" in t and "HORA" in t
+    has_staff_columns = "PRESTADOR" in t and "FIRMA PRESTADOR" in t
+    has_nursing_context = (
+        "AUXILIAR DE ENFERMERIA" in t
+        or "ENFERMERIA" in t
+        or "ENFERMERA" in t
+    )
+    narrative_hits = sum(
+        [
+            1 if "PACIENTE" in t else 0,
+            1 if "SE REALIZA" in t else 0,
+            1 if "SE ADMINISTRA" in t else 0,
+            1 if "SE OBSERVA" in t else 0,
+            1 if "LLEGA AL DOMICILIO" in t else 0,
+            1 if "SIN COMPLICACIONES" in t else 0,
+            1 if "AUXILIAR DE ENFERMERIA" in t else 0,
+        ]
+    )
+
+    if has_header and has_datetime_columns and has_staff_columns:
+        return True
+
+    return (
+        has_sequence_column
+        and has_datetime_columns
+        and has_staff_columns
+        and has_nursing_context
+        and narrative_hits >= 2
+    )
 
 
 def _looks_like_otros_servicios_crc_signos_vitales_header(t: str) -> bool:
@@ -935,6 +1024,8 @@ def _classify_text(
     if has_historia_hint:
         return "HEV"
     if service == "otros_servicios":
+        if _looks_like_otros_servicios_hev_nota_enfermeria(t):
+            return "HEV"
         if (
             _looks_like_otros_servicios_crc_terapias(t)
             or _looks_like_otros_servicios_crc_medicamentos(t)
