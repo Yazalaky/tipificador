@@ -1003,7 +1003,10 @@ def _classify_text(
     # Regla de negocio: "ORDEN MEDICA (DECISIONES)" siempre va a OPF.
     if has_opf_decisiones:
         return "OPF"
-    if has_hev_social_hint:
+    # En otros servicios, frases como "TRABAJO SOCIAL" pueden aparecer dentro de
+    # facturas, autorizaciones o registros CRC válidos. Dejamos que esas reglas
+    # más específicas se evalúen primero para no forzar HEV demasiado pronto.
+    if has_hev_social_hint and service != "otros_servicios":
         return "HEV"
     # Excepcion de negocio: "CERTIFICACION DETALLE DE CARGOS" se clasifica como HEV.
     if "CERTIFICACION DETALLE DE CARGOS" in t or "CERTIFICACION DEL DETALLE DE CARGOS" in t:
