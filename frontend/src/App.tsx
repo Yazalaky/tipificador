@@ -3,7 +3,18 @@ import React, { useMemo, useRef, useState } from "react";
 type Category = "CRC" | "FEV" | "HEV" | "OPF" | "PDE";
 const CATEGORIES: Category[] = ["CRC", "FEV", "HEV", "OPF", "PDE"];
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+const API_BASE = (import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000").replace(/\/+$/, "");
+const APP_HOST =
+  typeof window !== "undefined" ? window.location.hostname : "";
+const APP_IS_LOCAL = APP_HOST === "127.0.0.1" || APP_HOST === "localhost";
+const API_BASE_IS_LOCAL = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(API_BASE);
+
+function getApiConnectionMessage() {
+  if (!APP_IS_LOCAL && API_BASE_IS_LOCAL) {
+    return `La aplicacion esta apuntando a ${API_BASE}. Esa URL es local y no funcionara fuera de tu equipo. Vuelve a desplegar el frontend con VITE_API_BASE apuntando al backend publicado.`;
+  }
+  return `No se pudo conectar con la API (${API_BASE}). Verifica que el backend este disponible y que VITE_API_BASE este bien configurado.`;
+}
 
 type DetectError = {
   message: string;
@@ -303,52 +314,53 @@ export default function App() {
 
   async function onBatchUpload(file: File | null) {
     if (!file) return;
+    if (!APP_IS_LOCAL && API_BASE_IS_LOCAL) {
+      alert(getApiConnectionMessage());
+      return;
+    }
     resetBatchState();
     setBatchUploading(true);
 
     const tryGcs = async () => {
-      const res = await fetch(`${API_BASE}/batch/upload-url`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: file.name, service: service ?? "cuidador" }),
-      });
-      if (!res.ok) {
+      try {
+        const res = await fetch(`${API_BASE}/batch/upload-url`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ filename: file.name, service: service ?? "cuidador" }),
+        });
+        if (!res.ok) {
+          return null;
+        }
+        const data = await res.json();
+        if (!data?.uploadUrl || !data?.gcsPath) {
+          return null;
+        }
+        const putRes = await fetch(data.uploadUrl, {
+          method: "PUT",
+          headers: { "Content-Type": "application/zip" },
+          body: file,
+        });
+        if (!putRes.ok) {
+          throw new Error("No se pudo subir el ZIP a GCS.");
+        }
+        const batchRes = await fetch(`${API_BASE}/batch/from-gcs`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gcsPath: data.gcsPath, service: service ?? "cuidador" }),
+        });
+        if (!batchRes.ok) {
+          const t = await batchRes.text();
+          throw new Error(t || "No se pudo crear el lote desde GCS.");
+        }
+        return batchRes.json();
+      } catch (err) {
+        // Si la ruta GCS no esta disponible o la API no responde aqui, intentamos
+        // el upload directo al endpoint /batch antes de fallar por completo.
         return null;
       }
-      const data = await res.json();
-      if (!data?.uploadUrl || !data?.gcsPath) {
-        return null;
-      }
-      const putRes = await fetch(data.uploadUrl, {
-        method: "PUT",
-        headers: { "Content-Type": "application/zip" },
-        body: file,
-      });
-      if (!putRes.ok) {
-        throw new Error("No se pudo subir el ZIP a GCS.");
-      }
-      const batchRes = await fetch(`${API_BASE}/batch/from-gcs`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ gcsPath: data.gcsPath, service: service ?? "cuidador" }),
-      });
-      if (!batchRes.ok) {
-        const t = await batchRes.text();
-        throw new Error(t || "No se pudo crear el lote desde GCS.");
-      }
-      return batchRes.json();
     };
 
-    let data: any = null;
-    try {
-      data = await tryGcs();
-    } catch (err: any) {
-      setBatchUploading(false);
-      alert(err?.message || "Error subiendo lote a GCS.");
-      return;
-    }
-
-    if (!data) {
+    const uploadBatchDirect = async () => {
       const form = new FormData();
       form.append("file", file);
       form.append("service", service ?? "cuidador");
@@ -360,12 +372,26 @@ export default function App() {
 
       if (!res.ok) {
         const t = await res.text();
-        setBatchUploading(false);
-        alert(`Error subiendo lote: ${t}`);
-        return;
+        throw new Error(t || "Error subiendo lote.");
       }
 
-      data = await res.json();
+      return res.json();
+    };
+
+    let data: any = null;
+    try {
+      data = await tryGcs();
+      if (!data) {
+        data = await uploadBatchDirect();
+      }
+    } catch (err: any) {
+      setBatchUploading(false);
+      if (err instanceof TypeError) {
+        alert(getApiConnectionMessage());
+      } else {
+        alert(err?.message || "Error subiendo lote.");
+      }
+      return;
     }
 
     setBatchId(data.batchId);
