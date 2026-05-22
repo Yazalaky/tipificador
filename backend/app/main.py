@@ -79,7 +79,7 @@ _TIME_RE = re.compile(r"\b\d{2}:\d{2}\b")
 _FEV_HINTS = ("FACTURA ELECTRONICA DE VENTA", "FACTURA ELECTRÓNICA DE VENTA")
 _NC_HINTS = ("NOTA DE CREDITO ELECTRONICA", "NOTA DE CRÉDITO ELECTRONICA")
 _AUTO_RULES_STRONG: List[Tuple[str, Tuple[str, ...]]] = [
-    ("PDE", ("AUTORIZACION SERVICIOS", "AUTORIZACION SERVICIOS ")),
+    ("PDE", ("AUTORIZACION SERVICIOS", "AUTORIZACION DE SERVICIOS")),
     ("OPF", ("ORDEN MEDICA", "ORDEN MÉDICA")),
     (
         "CRC",
@@ -1039,8 +1039,6 @@ def _classify_text(
             for p in patterns:
                 if p in t:
                     return cat
-        if _looks_like_otros_servicios_pde(t):
-            return "PDE"
         return "HEV"
     for cat, patterns in _AUTO_RULES_STRONG:
         for p in patterns:
@@ -1141,12 +1139,16 @@ def _page_text_for_classification(
     # 1) Texto embebido del PDF (rápido)
     text = _extract_page_text(job_id, page_index)
     if _text_is_useful(text):
-        if _classify_text(text, allow_crc_table=True, service=service):
+        embedded_classification = _classify_text(text, allow_crc_table=True, service=service)
+        if embedded_classification and not (
+            _normalize_service(service) == "otros_servicios" and embedded_classification == "HEV"
+        ):
             return text
         if cancel_check and cancel_check():
             raise RuntimeError("batch_cancelled")
         header_text = _ocr_page_text(job_id, page_index, header_only=True)
-        if _classify_text(header_text, allow_crc_table=False, service=service):
+        header_classification = _classify_text(header_text, allow_crc_table=False, service=service)
+        if header_classification and (embedded_classification != "HEV" or header_classification != "HEV"):
             return header_text
         return text
 
