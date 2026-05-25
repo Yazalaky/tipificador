@@ -19,4 +19,5 @@ gcloud run deploy "$SERVICE" \
   --image "$IMAGE_URI" \
   --region "$REGION" \
   --platform managed \
+  --no-cpu-throttling \
   --allow-unauthenticated
