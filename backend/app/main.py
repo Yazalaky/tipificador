@@ -1012,7 +1012,7 @@ def _classify_text(
     if "CERTIFICACION DETALLE DE CARGOS" in t or "CERTIFICACION DEL DETALLE DE CARGOS" in t:
         return "HEV"
     # Regla de negocio: OPF solo aplica si el texto contiene "ORDEN MEDICA".
-    has_opf_phrase = "ORDEN MEDICA" in t or "ORDEN MÉDICA" in t
+    has_opf_phrase = bool(re.search(r"\bORDEN\s+MEDICA\b", t))
     opf_context = (
         "ORDEN MEDICA (DECISIONES)" in t
         or "ORDEN MÉDICA (DECISIONES)" in t
