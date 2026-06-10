@@ -20,4 +20,5 @@ gcloud run deploy "$SERVICE" \
   --region "$REGION" \
   --platform managed \
   --no-cpu-throttling \
+  --update-env-vars TIPIFICADOR_OCR_WORKERS=2 \
   --allow-unauthenticated

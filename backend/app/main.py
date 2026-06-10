@@ -3,6 +3,7 @@ import re
 import json
 import uuid
 import time
+import logging
 import unicodedata
 import shutil
 import zipfile
@@ -21,6 +22,15 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, H
 from fastapi.responses import Response, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+
+logger = logging.getLogger("tipificador")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    logger.addHandler(handler)
+logger.propagate = False
 
 
 # ----------------------------
@@ -1362,6 +1372,11 @@ def _zip_bytes(files: List[Tuple[str, bytes]]) -> bytes:
     return buf.getvalue()
 
 
+def _log_timing(event: str, **fields) -> None:
+    payload = {"event": event, **fields}
+    logger.info(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
 # ----------------------------
 # API Models
 # ----------------------------
@@ -1633,14 +1648,25 @@ def _auto_classify_internal_with_cancel(
     if not OCR_ENABLED:
         raise HTTPException(status_code=503, detail="OCR deshabilitado en el servidor.")
 
-    texts: Dict[int, str] = {}
-    for i in range(total):
-        texts[i] = _page_text_for_classification(
+    def _text_for_index(idx: int) -> Tuple[int, str]:
+        if cancel_check and cancel_check():
+            raise RuntimeError("batch_cancelled")
+        return idx, _page_text_for_classification(
             job_id,
-            i,
+            idx,
             cancel_check=cancel_check,
             service=service,
         )
+
+    texts: Dict[int, str] = {}
+    if OCR_WORKERS > 1 and total > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=OCR_WORKERS) as executor:
+            for idx, text in executor.map(_text_for_index, range(total)):
+                texts[idx] = text
+    else:
+        for i in range(total):
+            idx, text = _text_for_index(i)
+            texts[idx] = text
 
     # Primera pasada: solo reglas fuertes (sin estructura de tabla)
     strong: Dict[int, Optional[str]] = {}
@@ -1788,8 +1814,16 @@ def process_job(job_id: str, req: ProcessRequest):
 
 
 def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> None:
+    batch_t0 = time.perf_counter()
     meta = _load_batch_meta(batch_id)
     service = _normalize_service(meta.get("service"))
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        stage="batch_start",
+        service=service,
+        packages=len(meta.get("packages", [])),
+    )
     meta["status"] = "processing"
     _save_batch_meta(batch_id, meta)
 
@@ -1804,6 +1838,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
 
     cancelled = False
     for pkg in meta.get("packages", []):
+        pkg_t0 = time.perf_counter()
         if meta.get("cancelRequested"):
             cancelled = True
             break
@@ -1814,27 +1849,91 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
         _save_batch_meta(batch_id, meta)
         try:
             pkg_dir = os.path.join(input_dir, pkg["folder"])
+            stage_t0 = time.perf_counter()
             pdfs = _collect_pdf_paths(pkg_dir)
+            _log_timing(
+                "batch_timing",
+                batchId=batch_id,
+                package=pkg.get("name"),
+                stage="collect_pdfs",
+                seconds=round(time.perf_counter() - stage_t0, 3),
+                pdfs=len(pdfs),
+            )
+
+            stage_t0 = time.perf_counter()
             job_id, _ = _create_job_from_pdf_paths(pdfs)
             pkg["jobId"] = job_id
+            meta_pages = _load_meta(job_id).get("totalPages", 0)
+            _log_timing(
+                "batch_timing",
+                batchId=batch_id,
+                package=pkg.get("name"),
+                jobId=job_id,
+                stage="create_job",
+                seconds=round(time.perf_counter() - stage_t0, 3),
+                pages=meta_pages,
+            )
 
+            stage_t0 = time.perf_counter()
             classifications = _auto_classify_internal_with_cancel(
                 job_id,
                 cancel_check=lambda: _load_batch_meta(batch_id).get("cancelRequested", False),
                 service=service,
             )
+            counts = {c: 0 for c in CATEGORIES}
+            for value in classifications.values():
+                if value in counts:
+                    counts[value] += 1
+            _log_timing(
+                "batch_timing",
+                batchId=batch_id,
+                package=pkg.get("name"),
+                jobId=job_id,
+                stage="auto_classify",
+                seconds=round(time.perf_counter() - stage_t0, 3),
+                pages=meta_pages,
+                counts=counts,
+            )
+
             req = ProcessRequest(classifications=classifications, keepJob=False)
+            stage_t0 = time.perf_counter()
             download_name, zip_bytes = _process_job_bytes(job_id, req)
+            _log_timing(
+                "batch_timing",
+                batchId=batch_id,
+                package=pkg.get("name"),
+                jobId=job_id,
+                stage="process_job",
+                seconds=round(time.perf_counter() - stage_t0, 3),
+                zipBytes=len(zip_bytes),
+            )
 
             result_filename = f"{pkg['name']}.zip"
             result_path = os.path.join(results_dir, result_filename)
+            stage_t0 = time.perf_counter()
             with open(result_path, "wb") as f:
                 f.write(zip_bytes)
+            _log_timing(
+                "batch_timing",
+                batchId=batch_id,
+                package=pkg.get("name"),
+                stage="write_result",
+                seconds=round(time.perf_counter() - stage_t0, 3),
+                zipBytes=len(zip_bytes),
+            )
 
             pkg["resultFile"] = result_filename
             pkg["downloadName"] = download_name
             pkg["status"] = "done"
             done += 1
+            _log_timing(
+                "batch_timing",
+                batchId=batch_id,
+                package=pkg.get("name"),
+                jobId=job_id,
+                stage="package_done",
+                seconds=round(time.perf_counter() - pkg_t0, 3),
+            )
         except RuntimeError as e:
             if str(e) == "batch_cancelled":
                 pkg["status"] = "cancelled"
@@ -1855,9 +1954,19 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
             pkg["status"] = "error"
             pkg["error"] = str(e)
             errors += 1
+        if pkg.get("status") == "error":
+            _log_timing(
+                "batch_timing",
+                batchId=batch_id,
+                package=pkg.get("name"),
+                stage="package_error",
+                seconds=round(time.perf_counter() - pkg_t0, 3),
+                error=pkg.get("error"),
+            )
         _save_batch_meta(batch_id, meta)
 
     # Build consolidated ZIP
+    stage_t0 = time.perf_counter()
     all_path = os.path.join(results_dir, "all.zip")
     with zipfile.ZipFile(all_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for pkg in meta.get("packages", []):
@@ -1871,8 +1980,15 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
             zf.write(file_path, arcname=arcname)
 
     meta["allZip"] = "all.zip"
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        stage="build_all_zip",
+        seconds=round(time.perf_counter() - stage_t0, 3),
+    )
 
     if _gcs_enabled():
+        stage_t0 = time.perf_counter()
         try:
             client = _gcs_client()
             bucket = client.bucket(GCS_BUCKET)
@@ -1898,6 +2014,13 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
                 meta["gcsAllZip"] = f"gs://{GCS_BUCKET}/{all_object}"
         except Exception as e:
             meta["gcsError"] = str(e)
+        _log_timing(
+            "batch_timing",
+            batchId=batch_id,
+            stage="upload_results_gcs",
+            seconds=round(time.perf_counter() - stage_t0, 3),
+            gcsError=meta.get("gcsError"),
+        )
 
     done_count = sum(1 for p in meta.get("packages", []) if p.get("status") == "done")
     error_count = sum(1 for p in meta.get("packages", []) if p.get("status") == "error")
@@ -1920,6 +2043,15 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
     else:
         meta["status"] = "pending"
     _save_batch_meta(batch_id, meta)
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        stage="batch_done",
+        seconds=round(time.perf_counter() - batch_t0, 3),
+        status=meta.get("status"),
+        done=done_count,
+        errors=error_count,
+    )
 
 
 def _build_batch_from_zip(
@@ -1933,12 +2065,22 @@ def _build_batch_from_zip(
     input_dir = os.path.join(bdir, "input")
     os.makedirs(input_dir, exist_ok=True)
 
+    stage_t0 = time.perf_counter()
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             _safe_extract_zip(zf, input_dir)
     except zipfile.BadZipFile:
         shutil.rmtree(bdir, ignore_errors=True)
         raise HTTPException(status_code=400, detail="ZIP inválido o corrupto.")
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        stage="extract_zip",
+        service=service,
+        seconds=round(time.perf_counter() - stage_t0, 3),
+        zipBytes=os.path.getsize(zip_path) if os.path.exists(zip_path) else None,
+        source="gcs" if source_gcs_path else "direct",
+    )
 
     pkg_folders = [
         name for name in os.listdir(input_dir)
@@ -1996,7 +2138,17 @@ async def create_batch(
     os.makedirs(input_dir, exist_ok=True)
 
     zip_path = os.path.join(bdir, "batch.zip")
+    stage_t0 = time.perf_counter()
     await _save_upload_file_limited(file, zip_path, MAX_BATCH_BYTES)
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        stage="upload_zip",
+        service=_normalize_service(service),
+        seconds=round(time.perf_counter() - stage_t0, 3),
+        zipBytes=os.path.getsize(zip_path) if os.path.exists(zip_path) else None,
+        source="direct",
+    )
     return _build_batch_from_zip(
         batch_id,
         zip_path,
@@ -2041,7 +2193,17 @@ def create_batch_from_gcs(req: BatchFromGCSRequest):
     bdir = _batch_dir(batch_id)
     os.makedirs(bdir, exist_ok=True)
     zip_path = os.path.join(bdir, "batch.zip")
+    stage_t0 = time.perf_counter()
     blob.download_to_filename(zip_path)
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        stage="download_zip_gcs",
+        service=_normalize_service(req.service),
+        seconds=round(time.perf_counter() - stage_t0, 3),
+        zipBytes=os.path.getsize(zip_path) if os.path.exists(zip_path) else None,
+        source="gcs",
+    )
 
     resp = _build_batch_from_zip(
         batch_id,
