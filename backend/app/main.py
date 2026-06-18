@@ -224,6 +224,14 @@ def _load_batch_meta(batch_id: str) -> dict:
     raise HTTPException(status_code=503, detail="Batch temporalmente ocupado, intenta de nuevo.")
 
 
+def _load_batch_meta_latest(batch_id: str) -> dict:
+    if _gcs_enabled():
+        meta = _load_batch_meta_from_gcs(batch_id)
+        if meta is not None:
+            return meta
+    return _load_batch_meta(batch_id)
+
+
 def _save_batch_meta(batch_id: str, meta: dict) -> None:
     path = _batch_meta_path(batch_id)
     os.makedirs(_batch_dir(batch_id), exist_ok=True)
@@ -280,6 +288,20 @@ def _delete_gcs_object(gcs_path: str) -> None:
     except Exception:
         # Best-effort cleanup; do not fail batch creation
         return
+
+
+def _persist_batch_source_zip(batch_id: str, zip_path: str) -> Optional[str]:
+    if not _gcs_enabled() or not os.path.exists(zip_path):
+        return None
+    try:
+        client = _gcs_client()
+        bucket = client.bucket(GCS_BUCKET)
+        object_name = f"{_normalize_prefix(GCS_RESULTS_PREFIX)}{batch_id}/source.zip"
+        blob = bucket.blob(object_name)
+        blob.upload_from_filename(zip_path, content_type="application/zip")
+        return f"gs://{GCS_BUCKET}/{object_name}"
+    except Exception:
+        return None
 
 
 def _cleanup_gcs_results(max_age_minutes: int) -> int:
@@ -2093,6 +2115,26 @@ def _build_batch_from_zip(
         shutil.rmtree(bdir, ignore_errors=True)
         raise HTTPException(status_code=413, detail=f"Máximo {MAX_BATCH_PACKAGES} paquetes por lote.")
 
+    empty_packages: List[str] = []
+    for folder in sorted(pkg_folders):
+        pkg_dir = os.path.join(input_dir, folder)
+        if not _collect_pdf_paths(pkg_dir):
+            empty_packages.append(folder)
+    if empty_packages:
+        shutil.rmtree(bdir, ignore_errors=True)
+        if len(empty_packages) == 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"El paquete '{empty_packages[0]}' no contiene archivos PDF.",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Los siguientes paquetes no contienen archivos PDF: "
+                + ", ".join(empty_packages)
+            ),
+        )
+
     packages = []
     for folder in sorted(pkg_folders):
         packages.append({
@@ -2106,6 +2148,8 @@ def _build_batch_from_zip(
             "gcsResult": None,
         })
 
+    stable_source_gcs_path = _persist_batch_source_zip(batch_id, zip_path) or source_gcs_path
+
     meta = {
         "batchId": batch_id,
         "service": service,
@@ -2115,7 +2159,7 @@ def _build_batch_from_zip(
         "packages": packages,
         "allZip": None,
         "gcsAllZip": None,
-        "sourceGcsPath": source_gcs_path,
+        "sourceGcsPath": stable_source_gcs_path,
     }
     _save_batch_meta(batch_id, meta)
 
@@ -2212,11 +2256,11 @@ def create_batch_from_gcs(req: BatchFromGCSRequest):
         source_gcs_path=req.gcsPath,
         service=req.service or "cuidador",
     )
-    _delete_gcs_object(req.gcsPath)
     try:
         meta = _load_batch_meta(batch_id)
-        meta["sourceGcsPath"] = None
-        _save_batch_meta(batch_id, meta)
+        persisted_source = meta.get("sourceGcsPath")
+        if req.gcsPath and persisted_source and persisted_source != req.gcsPath:
+            _delete_gcs_object(req.gcsPath)
     except Exception:
         pass
     return resp
@@ -2224,7 +2268,7 @@ def create_batch_from_gcs(req: BatchFromGCSRequest):
 
 @app.get("/batch/{batch_id}")
 def get_batch(batch_id: str):
-    meta = _reconcile_batch_meta(batch_id, _load_batch_meta(batch_id))
+    meta = _reconcile_batch_meta(batch_id, _load_batch_meta_latest(batch_id))
     return {
         "batchId": meta.get("batchId"),
         "service": meta.get("service", "cuidador"),
@@ -2246,7 +2290,7 @@ def get_batch(batch_id: str):
 
 @app.post("/batch/{batch_id}/start")
 def start_batch(batch_id: str):
-    meta = _load_batch_meta(batch_id)
+    meta = _load_batch_meta_latest(batch_id)
     if meta.get("status") in {"processing"}:
         return {"batchId": batch_id, "status": meta.get("status")}
     if meta.get("status") in {"done"}:
@@ -2265,7 +2309,7 @@ def start_batch(batch_id: str):
 
 @app.post("/batch/{batch_id}/cancel")
 def cancel_batch(batch_id: str):
-    meta = _load_batch_meta(batch_id)
+    meta = _load_batch_meta_latest(batch_id)
     if meta.get("status") in {"ready", "pending"}:
         meta["cancelRequested"] = False
         meta["status"] = "cancelled"
@@ -2279,7 +2323,7 @@ def cancel_batch(batch_id: str):
 
 @app.post("/batch/{batch_id}/retry-errors")
 def retry_batch_errors(batch_id: str):
-    meta = _load_batch_meta(batch_id)
+    meta = _load_batch_meta_latest(batch_id)
     error_pkgs = [p.get("name") for p in meta.get("packages", []) if p.get("status") == "error"]
     if not error_pkgs:
         return {"batchId": batch_id, "retried": 0}
