@@ -28,10 +28,37 @@ type ModeId = "single" | "batch";
 type BatchPackage = {
   name: string;
   status: string;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  elapsedSeconds?: number | null;
   jobId?: string | null;
   downloadName?: string | null;
   error?: string | Record<string, unknown> | null;
 };
+
+function formatElapsedSeconds(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value) || value < 0) return null;
+  if (value < 60) return `${value.toFixed(1)} s`;
+  const totalSeconds = Math.round(value);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function resolveElapsedSeconds(
+  startedAt?: number | null,
+  elapsedSeconds?: number | null,
+  isRunning?: boolean,
+  nowMs?: number
+) {
+  if (elapsedSeconds != null && Number.isFinite(elapsedSeconds)) return elapsedSeconds;
+  if (!isRunning || !startedAt) return null;
+  return Math.max(0, nowMs! / 1000 - startedAt);
+}
 
 function inferBatchStatus(status: string | null | undefined, packages: BatchPackage[]) {
   if (status && status !== "processing") return status;
@@ -108,9 +135,12 @@ export default function App() {
   const [batchId, setBatchId] = useState<string | null>(null);
   const [batchStatus, setBatchStatus] = useState<string | null>(null);
   const [batchPackages, setBatchPackages] = useState<BatchPackage[]>([]);
+  const [batchStartedAt, setBatchStartedAt] = useState<number | null>(null);
+  const [batchElapsedSeconds, setBatchElapsedSeconds] = useState<number | null>(null);
   const [batchRetrying, setBatchRetrying] = useState(false);
   const [batchNotice, setBatchNotice] = useState<string | null>(null);
   const [batchActive, setBatchActive] = useState(false);
+  const [clockNow, setClockNow] = useState(() => Date.now());
   const serviceLabel = useMemo(() => {
     if (!service) return "";
     return service === "cuidador" ? "Cuidador" : "Otros Servicios";
@@ -155,6 +185,8 @@ export default function App() {
     setBatchId(null);
     setBatchStatus(null);
     setBatchPackages([]);
+    setBatchStartedAt(null);
+    setBatchElapsedSeconds(null);
     setBatchNotice(null);
     setBatchActive(false);
     if (batchInputRef.current) {
@@ -424,6 +456,8 @@ export default function App() {
       const status = inferBatchStatus(data.status || "pending", packages);
       setBatchStatus(status);
       setBatchPackages(packages);
+      setBatchStartedAt(data.startedAt ?? null);
+      setBatchElapsedSeconds(data.elapsedSeconds ?? null);
       if (status && ["done", "partial", "error", "cancelled"].includes(status)) {
         setBatchActive(false);
       }
@@ -517,6 +551,16 @@ export default function App() {
     };
   }, [batchId, batchActive]);
 
+  React.useEffect(() => {
+    if (!batchId) return;
+    const liveStatus = inferBatchStatus(batchStatusRef.current, batchPackagesRef.current);
+    if (!batchActive && liveStatus !== "processing" && liveStatus !== "cancelling") {
+      return;
+    }
+    const timer = window.setInterval(() => setClockNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [batchId, batchActive]);
+
   const typedCount = totalPages - counts.SIN;
   const progress = totalPages > 0 ? Math.round((typedCount / totalPages) * 100) : 0;
 
@@ -531,6 +575,17 @@ export default function App() {
   const batchProgress = batchTotal > 0 ? Math.round(((batchDone + batchError) / batchTotal) * 100) : 0;
   const effectiveBatchStatus = inferBatchStatus(batchStatus, batchPackages);
   const batchBusy = effectiveBatchStatus === "processing" || effectiveBatchStatus === "cancelling";
+  const batchLiveSeconds = resolveElapsedSeconds(
+    batchStartedAt,
+    batchElapsedSeconds,
+    effectiveBatchStatus === "processing" || effectiveBatchStatus === "cancelling",
+    clockNow
+  );
+  const batchElapsedLabel = formatElapsedSeconds(batchLiveSeconds);
+  const getPackageElapsedLabel = (pkg: BatchPackage) =>
+    formatElapsedSeconds(
+      resolveElapsedSeconds(pkg.startedAt, pkg.elapsedSeconds, pkg.status === "processing", clockNow)
+    );
 
   return (
     <div className="app">
@@ -638,6 +693,7 @@ export default function App() {
                     <span className={`chip chip--status chip--${effectiveBatchStatus || "ready"}`}>
                       {effectiveBatchStatus || "ready"}
                     </span>
+                    {batchElapsedLabel && <span className="chip chip--muted">Tiempo total: {batchElapsedLabel}</span>}
                   </div>
                   <div className="row">
                     {effectiveBatchStatus === "ready" && (
@@ -677,23 +733,29 @@ export default function App() {
                   </div>
                 </div>
                 <div className="batchList">
-                  {batchPackages.map((p) => (
-                    <div key={p.name} className="batchItem">
-                      <div className="batchName">{p.name}</div>
-                      <span className={`chip chip--status chip--${p.status}`}>{p.status}</span>
-                      {p.status === "done" && (
-                        <a
-                          className="btn btn--tonal btn--sm"
-                          href={`${API_BASE}/batch/${batchId}/download/${p.name}.zip`}
-                        >
-                          Descargar
-                        </a>
-                      )}
-                      {p.status === "error" && (
-                        <span className="small errorText">{formatBatchError(p.error)}</span>
-                      )}
-                    </div>
-                  ))}
+                  {batchPackages.map((p) => {
+                    const packageElapsedLabel = getPackageElapsedLabel(p);
+                    return (
+                      <div key={p.name} className="batchItem">
+                        <div>
+                          <div className="batchName">{p.name}</div>
+                          {packageElapsedLabel && <div className="small">Tiempo: {packageElapsedLabel}</div>}
+                        </div>
+                        <span className={`chip chip--status chip--${p.status}`}>{p.status}</span>
+                        {p.status === "done" && (
+                          <a
+                            className="btn btn--tonal btn--sm"
+                            href={`${API_BASE}/batch/${batchId}/download/${p.name}.zip`}
+                          >
+                            Descargar
+                          </a>
+                        )}
+                        {p.status === "error" && (
+                          <span className="small errorText">{formatBatchError(p.error)}</span>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}

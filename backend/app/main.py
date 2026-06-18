@@ -1839,6 +1839,9 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
     batch_t0 = time.perf_counter()
     meta = _load_batch_meta(batch_id)
     service = _normalize_service(meta.get("service"))
+    meta["startedAt"] = meta.get("startedAt") or time.time()
+    meta["finishedAt"] = None
+    meta["elapsedSeconds"] = None
     _log_timing(
         "batch_timing",
         batchId=batch_id,
@@ -1866,6 +1869,9 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
             break
         if target_set and pkg.get("name") not in target_set:
             continue
+        pkg["startedAt"] = time.time()
+        pkg["finishedAt"] = None
+        pkg["elapsedSeconds"] = None
         pkg["status"] = "processing"
         pkg["error"] = None
         _save_batch_meta(batch_id, meta)
@@ -1943,9 +1949,11 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
                 seconds=round(time.perf_counter() - stage_t0, 3),
                 zipBytes=len(zip_bytes),
             )
-
+            
             pkg["resultFile"] = result_filename
             pkg["downloadName"] = download_name
+            pkg["finishedAt"] = time.time()
+            pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
             pkg["status"] = "done"
             done += 1
             _log_timing(
@@ -1958,14 +1966,20 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
             )
         except RuntimeError as e:
             if str(e) == "batch_cancelled":
+                pkg["finishedAt"] = time.time()
+                pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
                 pkg["status"] = "cancelled"
                 pkg["error"] = "cancelled"
                 cancelled = True
             else:
+                pkg["finishedAt"] = time.time()
+                pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
                 pkg["status"] = "error"
                 pkg["error"] = str(e)
                 errors += 1
         except HTTPException as e:
+            pkg["finishedAt"] = time.time()
+            pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
             pkg["status"] = "error"
             if isinstance(e.detail, dict) and "message" in e.detail:
                 pkg["error"] = e.detail.get("message")
@@ -1973,6 +1987,8 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
                 pkg["error"] = str(e.detail)
             errors += 1
         except Exception as e:
+            pkg["finishedAt"] = time.time()
+            pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
             pkg["status"] = "error"
             pkg["error"] = str(e)
             errors += 1
@@ -2064,6 +2080,8 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
         meta["status"] = "done"
     else:
         meta["status"] = "pending"
+    meta["finishedAt"] = time.time()
+    meta["elapsedSeconds"] = round(meta["finishedAt"] - (meta.get("startedAt") or meta["finishedAt"]), 3)
     _save_batch_meta(batch_id, meta)
     _log_timing(
         "batch_timing",
@@ -2141,6 +2159,9 @@ def _build_batch_from_zip(
             "name": folder,
             "folder": folder,
             "status": "pending",
+            "startedAt": None,
+            "finishedAt": None,
+            "elapsedSeconds": None,
             "jobId": None,
             "resultFile": None,
             "downloadName": None,
@@ -2154,6 +2175,9 @@ def _build_batch_from_zip(
         "batchId": batch_id,
         "service": service,
         "createdAt": time.time(),
+        "startedAt": None,
+        "finishedAt": None,
+        "elapsedSeconds": None,
         "status": "ready",
         "cancelRequested": False,
         "packages": packages,
@@ -2273,12 +2297,18 @@ def get_batch(batch_id: str):
         "batchId": meta.get("batchId"),
         "service": meta.get("service", "cuidador"),
         "createdAt": meta.get("createdAt"),
+        "startedAt": meta.get("startedAt"),
+        "finishedAt": meta.get("finishedAt"),
+        "elapsedSeconds": meta.get("elapsedSeconds"),
         "status": meta.get("status"),
         "cancelRequested": meta.get("cancelRequested", False),
         "packages": [
             {
                 "name": p.get("name"),
                 "status": p.get("status"),
+                "startedAt": p.get("startedAt"),
+                "finishedAt": p.get("finishedAt"),
+                "elapsedSeconds": p.get("elapsedSeconds"),
                 "jobId": p.get("jobId"),
                 "downloadName": p.get("downloadName"),
                 "error": p.get("error"),
@@ -2301,6 +2331,10 @@ def start_batch(batch_id: str):
         if not os.path.isdir(input_dir) or not os.listdir(input_dir):
             _restore_batch_input_from_gcs(batch_id, source_gcs)
     meta["cancelRequested"] = False
+    if not meta.get("startedAt"):
+        meta["startedAt"] = time.time()
+    meta["finishedAt"] = None
+    meta["elapsedSeconds"] = None
     meta["status"] = "processing"
     _save_batch_meta(batch_id, meta)
     threading.Thread(target=_process_batch, args=(batch_id,), daemon=True).start()
@@ -2327,6 +2361,10 @@ def retry_batch_errors(batch_id: str):
     error_pkgs = [p.get("name") for p in meta.get("packages", []) if p.get("status") == "error"]
     if not error_pkgs:
         return {"batchId": batch_id, "retried": 0}
+    if not meta.get("startedAt"):
+        meta["startedAt"] = time.time()
+    meta["finishedAt"] = None
+    meta["elapsedSeconds"] = None
     meta["status"] = "processing"
     meta["cancelRequested"] = False
     _save_batch_meta(batch_id, meta)
