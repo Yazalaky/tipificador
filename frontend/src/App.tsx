@@ -49,15 +49,9 @@ function formatElapsedSeconds(value: number | null | undefined) {
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
-function resolveElapsedSeconds(
-  startedAt?: number | null,
-  elapsedSeconds?: number | null,
-  isRunning?: boolean,
-  nowMs?: number
-) {
+function resolveElapsedSeconds(elapsedSeconds?: number | null) {
   if (elapsedSeconds != null && Number.isFinite(elapsedSeconds)) return elapsedSeconds;
-  if (!isRunning || !startedAt) return null;
-  return Math.max(0, nowMs! / 1000 - startedAt);
+  return null;
 }
 
 function inferBatchStatus(status: string | null | undefined, packages: BatchPackage[]) {
@@ -135,12 +129,10 @@ export default function App() {
   const [batchId, setBatchId] = useState<string | null>(null);
   const [batchStatus, setBatchStatus] = useState<string | null>(null);
   const [batchPackages, setBatchPackages] = useState<BatchPackage[]>([]);
-  const [batchStartedAt, setBatchStartedAt] = useState<number | null>(null);
   const [batchElapsedSeconds, setBatchElapsedSeconds] = useState<number | null>(null);
   const [batchRetrying, setBatchRetrying] = useState(false);
   const [batchNotice, setBatchNotice] = useState<string | null>(null);
   const [batchActive, setBatchActive] = useState(false);
-  const [clockNow, setClockNow] = useState(() => Date.now());
   const serviceLabel = useMemo(() => {
     if (!service) return "";
     return service === "cuidador" ? "Cuidador" : "Otros Servicios";
@@ -185,7 +177,6 @@ export default function App() {
     setBatchId(null);
     setBatchStatus(null);
     setBatchPackages([]);
-    setBatchStartedAt(null);
     setBatchElapsedSeconds(null);
     setBatchNotice(null);
     setBatchActive(false);
@@ -456,7 +447,6 @@ export default function App() {
       const status = inferBatchStatus(data.status || "pending", packages);
       setBatchStatus(status);
       setBatchPackages(packages);
-      setBatchStartedAt(data.startedAt ?? null);
       setBatchElapsedSeconds(data.elapsedSeconds ?? null);
       if (status && ["done", "partial", "error", "cancelled"].includes(status)) {
         setBatchActive(false);
@@ -551,16 +541,6 @@ export default function App() {
     };
   }, [batchId, batchActive]);
 
-  React.useEffect(() => {
-    if (!batchId) return;
-    const liveStatus = inferBatchStatus(batchStatusRef.current, batchPackagesRef.current);
-    if (!batchActive && liveStatus !== "processing" && liveStatus !== "cancelling") {
-      return;
-    }
-    const timer = window.setInterval(() => setClockNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [batchId, batchActive]);
-
   const typedCount = totalPages - counts.SIN;
   const progress = totalPages > 0 ? Math.round((typedCount / totalPages) * 100) : 0;
 
@@ -576,16 +556,11 @@ export default function App() {
   const effectiveBatchStatus = inferBatchStatus(batchStatus, batchPackages);
   const batchBusy = effectiveBatchStatus === "processing" || effectiveBatchStatus === "cancelling";
   const batchLiveSeconds = resolveElapsedSeconds(
-    batchStartedAt,
-    batchElapsedSeconds,
-    effectiveBatchStatus === "processing" || effectiveBatchStatus === "cancelling",
-    clockNow
+    batchElapsedSeconds
   );
   const batchElapsedLabel = formatElapsedSeconds(batchLiveSeconds);
   const getPackageElapsedLabel = (pkg: BatchPackage) =>
-    formatElapsedSeconds(
-      resolveElapsedSeconds(pkg.startedAt, pkg.elapsedSeconds, pkg.status === "processing", clockNow)
-    );
+    formatElapsedSeconds(resolveElapsedSeconds(pkg.elapsedSeconds));
 
   return (
     <div className="app">

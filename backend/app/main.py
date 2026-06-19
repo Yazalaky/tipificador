@@ -244,6 +244,14 @@ def _save_batch_meta(batch_id: str, meta: dict) -> None:
     _save_batch_meta_to_gcs(batch_id, meta)
 
 
+def _live_elapsed_seconds(started_at, elapsed_seconds, status):
+    if elapsed_seconds is not None and isinstance(elapsed_seconds, (int, float)):
+        return elapsed_seconds
+    if status in {"processing", "cancelling"} and started_at:
+        return round(time.time() - started_at, 3)
+    return elapsed_seconds
+
+
 def _gcs_enabled() -> bool:
     return bool(GCS_BUCKET)
 
@@ -2293,14 +2301,15 @@ def create_batch_from_gcs(req: BatchFromGCSRequest):
 @app.get("/batch/{batch_id}")
 def get_batch(batch_id: str):
     meta = _reconcile_batch_meta(batch_id, _load_batch_meta_latest(batch_id))
+    batch_status = meta.get("status")
     return {
         "batchId": meta.get("batchId"),
         "service": meta.get("service", "cuidador"),
         "createdAt": meta.get("createdAt"),
         "startedAt": meta.get("startedAt"),
         "finishedAt": meta.get("finishedAt"),
-        "elapsedSeconds": meta.get("elapsedSeconds"),
-        "status": meta.get("status"),
+        "elapsedSeconds": _live_elapsed_seconds(meta.get("startedAt"), meta.get("elapsedSeconds"), batch_status),
+        "status": batch_status,
         "cancelRequested": meta.get("cancelRequested", False),
         "packages": [
             {
@@ -2308,7 +2317,7 @@ def get_batch(batch_id: str):
                 "status": p.get("status"),
                 "startedAt": p.get("startedAt"),
                 "finishedAt": p.get("finishedAt"),
-                "elapsedSeconds": p.get("elapsedSeconds"),
+                "elapsedSeconds": _live_elapsed_seconds(p.get("startedAt"), p.get("elapsedSeconds"), p.get("status")),
                 "jobId": p.get("jobId"),
                 "downloadName": p.get("downloadName"),
                 "error": p.get("error"),
