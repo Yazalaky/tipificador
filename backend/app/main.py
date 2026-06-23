@@ -10,6 +10,7 @@ import zipfile
 import subprocess
 import concurrent.futures
 import threading
+import sys
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Dict, List, Literal, Optional, Tuple
@@ -61,9 +62,12 @@ OCR_HEADER_DPI = int(os.environ.get("TIPIFICADOR_OCR_HEADER_DPI", str(min(200, O
 OCR_MIN_TEXT_LEN = int(os.environ.get("TIPIFICADOR_OCR_MIN_TEXT_LEN", "40"))
 OCR_KEEP_IMAGES = os.environ.get("TIPIFICADOR_OCR_KEEP_IMAGES", "0").lower() in {"1", "true", "yes"}
 OCR_WORKERS = int(os.environ.get("TIPIFICADOR_OCR_WORKERS", "4"))
+OCR_PAGE_TIMEOUT_SECONDS = int(os.environ.get("TIPIFICADOR_OCR_PAGE_TIMEOUT_SECONDS", "120"))
 PDF_REWRITE_ENABLED = os.environ.get("TIPIFICADOR_PDF_REWRITE_ENABLED", "1").lower() not in {"0", "false", "no"}
 MAX_BATCH_PACKAGES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_PACKAGES", "20"))
 MAX_BATCH_BYTES = int(os.environ.get("TIPIFICADOR_MAX_BATCH_BYTES", "524288000"))  # 500MB
+BATCH_PACKAGE_TIMEOUT_SECONDS = int(os.environ.get("TIPIFICADOR_BATCH_PACKAGE_TIMEOUT_SECONDS", "600"))
+BATCH_STALE_SECONDS = int(os.environ.get("TIPIFICADOR_BATCH_STALE_SECONDS", "900"))
 GCS_BUCKET = os.environ.get("TIPIFICADOR_GCS_BUCKET", "").strip()
 GCS_UPLOAD_PREFIX = os.environ.get("TIPIFICADOR_GCS_UPLOAD_PREFIX", "uploads/").strip()
 GCS_RESULTS_PREFIX = os.environ.get("TIPIFICADOR_GCS_RESULTS_PREFIX", "results/").strip()
@@ -409,8 +413,40 @@ def _restore_batch_input_from_gcs(batch_id: str, source_gcs_path: str) -> None:
 
 
 def _reconcile_batch_meta(batch_id: str, meta: dict) -> dict:
-    results_dir = os.path.join(_batch_dir(batch_id), "results")
     changed = False
+    stale_found = False
+    now = time.time()
+    if meta.get("status") in {"processing", "cancelling"}:
+        for pkg in meta.get("packages", []):
+            if pkg.get("status") != "processing":
+                continue
+            heartbeat = pkg.get("lastHeartbeatAt") or pkg.get("startedAt") or meta.get("startedAt")
+            if heartbeat and (now - float(heartbeat)) > BATCH_STALE_SECONDS:
+                stage = pkg.get("currentStage") or (pkg.get("audit") or {}).get("stage") or "desconocida"
+                pkg["status"] = "error"
+                pkg["finishedAt"] = now
+                pkg["elapsedSeconds"] = round(now - (pkg.get("startedAt") or now), 3)
+                pkg["error"] = (
+                    f"Paquete quedó sin avance por más de {BATCH_STALE_SECONDS}s "
+                    f"en etapa {stage}. Posible reinicio o crash del backend."
+                )
+                pkg["currentStage"] = "stale_error"
+                pkg["lastHeartbeatAt"] = now
+                changed = True
+                stale_found = True
+
+        if stale_found:
+            for pkg in meta.get("packages", []):
+                if pkg.get("status") == "pending":
+                    pkg["status"] = "error"
+                    pkg["finishedAt"] = now
+                    pkg["elapsedSeconds"] = None
+                    pkg["error"] = "Paquete no procesado porque el worker del lote se detuvo antes de iniciarlo. Usa Reintentar errores."
+                    pkg["currentStage"] = "not_started_after_stale"
+                    pkg["lastHeartbeatAt"] = now
+                    changed = True
+
+    results_dir = os.path.join(_batch_dir(batch_id), "results")
     if os.path.isdir(results_dir):
         for pkg in meta.get("packages", []):
             if pkg.get("status") == "done":
@@ -1150,10 +1186,16 @@ def _ocr_page_text(job_id: str, page_index: int, header_only: bool = False) -> s
 
     out_base = os.path.join(_job_dir(job_id), "cache", f"ocr_{page_index}{suffix}")
     cmd = ["tesseract", img_path, out_base, "-l", OCR_LANG, "--psm", str(OCR_PSM)]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=OCR_PAGE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"OCR timeout en página {page_index + 1} después de {OCR_PAGE_TIMEOUT_SECONDS}s")
     if res.returncode != 0 and OCR_LANG != "eng":
         cmd = ["tesseract", img_path, out_base, "-l", "eng", "--psm", str(OCR_PSM)]
-        subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=OCR_PAGE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"OCR timeout en página {page_index + 1} después de {OCR_PAGE_TIMEOUT_SECONDS}s")
 
     text = ""
     if os.path.exists(cache_txt):
@@ -1400,6 +1442,25 @@ def _zip_bytes(files: List[Tuple[str, bytes]]) -> bytes:
         for filename, data in files:
             zf.writestr(filename, data)
     return buf.getvalue()
+
+
+def _build_consolidated_batch_zip(batch_id: str, meta: dict) -> Optional[str]:
+    results_dir = os.path.join(_batch_dir(batch_id), "results")
+    os.makedirs(results_dir, exist_ok=True)
+    done_packages = [p for p in meta.get("packages", []) if p.get("status") == "done" and p.get("resultFile")]
+    if not done_packages:
+        return None
+    all_path = os.path.join(results_dir, "all.zip")
+    with zipfile.ZipFile(all_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for pkg in done_packages:
+            result_file = pkg.get("resultFile")
+            file_path = os.path.join(results_dir, result_file)
+            if not os.path.exists(file_path):
+                continue
+            arcname = pkg.get("downloadName") or result_file
+            zf.write(file_path, arcname=arcname)
+    meta["allZip"] = "all.zip"
+    return all_path
 
 
 def _log_timing(event: str, **fields) -> None:
@@ -1843,6 +1904,176 @@ def process_job(job_id: str, req: ProcessRequest):
     )
 
 
+def _find_batch_package(meta: dict, package_name: str) -> Optional[dict]:
+    return next((p for p in meta.get("packages", []) if p.get("name") == package_name), None)
+
+
+def _set_package_audit(batch_id: str, package_name: str, stage: str, **fields) -> None:
+    try:
+        meta = _load_batch_meta(batch_id)
+        pkg = _find_batch_package(meta, package_name)
+        if not pkg:
+            return
+        now = time.time()
+        pkg["currentStage"] = stage
+        pkg["lastHeartbeatAt"] = now
+        pkg["audit"] = {"stage": stage, "updatedAt": now, **fields}
+        _save_batch_meta(batch_id, meta)
+    except Exception:
+        return
+
+
+def _batch_package_result_path(batch_id: str, package_name: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", package_name or "package")
+    return os.path.join(_batch_dir(batch_id), f"worker_{safe_name}.json")
+
+
+def _process_batch_package_local(batch_id: str, package_name: str, service: str) -> dict:
+    meta = _load_batch_meta(batch_id)
+    pkg = _find_batch_package(meta, package_name)
+    if not pkg:
+        raise RuntimeError(f"Paquete no encontrado: {package_name}")
+
+    batch_dir = _batch_dir(batch_id)
+    input_dir = os.path.join(batch_dir, "input")
+    results_dir = os.path.join(batch_dir, "results")
+    os.makedirs(results_dir, exist_ok=True)
+
+    pkg_dir = os.path.join(input_dir, pkg["folder"])
+    _set_package_audit(batch_id, package_name, "collect_pdfs")
+    stage_t0 = time.perf_counter()
+    pdfs = _collect_pdf_paths(pkg_dir)
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        package=package_name,
+        stage="collect_pdfs",
+        seconds=round(time.perf_counter() - stage_t0, 3),
+        pdfs=len(pdfs),
+    )
+
+    _set_package_audit(batch_id, package_name, "create_job", pdfs=len(pdfs))
+    stage_t0 = time.perf_counter()
+    job_id, _ = _create_job_from_pdf_paths(pdfs)
+    meta_pages = _load_meta(job_id).get("totalPages", 0)
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        package=package_name,
+        jobId=job_id,
+        stage="create_job",
+        seconds=round(time.perf_counter() - stage_t0, 3),
+        pages=meta_pages,
+    )
+
+    def _cancel_requested() -> bool:
+        return _load_batch_meta(batch_id).get("cancelRequested", False)
+
+    _set_package_audit(batch_id, package_name, "auto_classify", jobId=job_id, pages=meta_pages)
+    stage_t0 = time.perf_counter()
+    classifications = _auto_classify_internal_with_cancel(
+        job_id,
+        cancel_check=_cancel_requested,
+        service=service,
+    )
+    counts = {c: 0 for c in CATEGORIES}
+    for value in classifications.values():
+        if value in counts:
+            counts[value] += 1
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        package=package_name,
+        jobId=job_id,
+        stage="auto_classify",
+        seconds=round(time.perf_counter() - stage_t0, 3),
+        pages=meta_pages,
+        counts=counts,
+    )
+
+    req = ProcessRequest(classifications=classifications, keepJob=False)
+    _set_package_audit(batch_id, package_name, "process_job", jobId=job_id, counts=counts)
+    stage_t0 = time.perf_counter()
+    download_name, zip_bytes = _process_job_bytes(job_id, req)
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        package=package_name,
+        jobId=job_id,
+        stage="process_job",
+        seconds=round(time.perf_counter() - stage_t0, 3),
+        zipBytes=len(zip_bytes),
+    )
+
+    result_filename = f"{package_name}.zip"
+    result_path = os.path.join(results_dir, result_filename)
+    _set_package_audit(batch_id, package_name, "write_result", jobId=job_id, zipBytes=len(zip_bytes))
+    stage_t0 = time.perf_counter()
+    with open(result_path, "wb") as f:
+        f.write(zip_bytes)
+    _log_timing(
+        "batch_timing",
+        batchId=batch_id,
+        package=package_name,
+        stage="write_result",
+        seconds=round(time.perf_counter() - stage_t0, 3),
+        zipBytes=len(zip_bytes),
+    )
+
+    return {
+        "jobId": job_id,
+        "resultFile": result_filename,
+        "downloadName": download_name,
+    }
+
+
+def _package_worker_error_message(returncode: int, result: Optional[dict]) -> str:
+    if result and result.get("error"):
+        return str(result.get("error"))
+    if returncode < 0:
+        return f"Proceso de tipificación terminó por señal {-returncode}. Posible PDF/OCR con fallo nativo."
+    return f"Proceso de tipificación falló con código {returncode}."
+
+
+def _run_batch_package_worker(batch_id: str, package_name: str, service: str) -> dict:
+    result_path = _batch_package_result_path(batch_id, package_name)
+    try:
+        if os.path.exists(result_path):
+            os.remove(result_path)
+    except OSError:
+        pass
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "app.batch_worker",
+        batch_id,
+        package_name,
+        service,
+        result_path,
+    ]
+    try:
+        completed = subprocess.run(cmd, timeout=BATCH_PACKAGE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Paquete excedió el tiempo máximo de {BATCH_PACKAGE_TIMEOUT_SECONDS}s."
+        )
+
+    result = None
+    if os.path.exists(result_path):
+        try:
+            with open(result_path, "r", encoding="utf-8") as f:
+                result = json.load(f)
+        except Exception:
+            result = None
+
+    if completed.returncode != 0:
+        raise RuntimeError(_package_worker_error_message(completed.returncode, result))
+    if not result or not result.get("ok"):
+        raise RuntimeError(_package_worker_error_message(completed.returncode, result))
+    return result.get("result") or {}
+
+
 def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> None:
     batch_t0 = time.perf_counter()
     meta = _load_batch_meta(batch_id)
@@ -1882,93 +2113,26 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
         pkg["elapsedSeconds"] = None
         pkg["status"] = "processing"
         pkg["error"] = None
+        pkg["currentStage"] = "worker_start"
+        pkg["lastHeartbeatAt"] = time.time()
+        pkg["audit"] = {"stage": "worker_start", "updatedAt": pkg["lastHeartbeatAt"]}
         _save_batch_meta(batch_id, meta)
         try:
-            pkg_dir = os.path.join(input_dir, pkg["folder"])
-            stage_t0 = time.perf_counter()
-            pdfs = _collect_pdf_paths(pkg_dir)
-            _log_timing(
-                "batch_timing",
-                batchId=batch_id,
-                package=pkg.get("name"),
-                stage="collect_pdfs",
-                seconds=round(time.perf_counter() - stage_t0, 3),
-                pdfs=len(pdfs),
-            )
-
-            stage_t0 = time.perf_counter()
-            job_id, _ = _create_job_from_pdf_paths(pdfs)
-            pkg["jobId"] = job_id
-            meta_pages = _load_meta(job_id).get("totalPages", 0)
-            _log_timing(
-                "batch_timing",
-                batchId=batch_id,
-                package=pkg.get("name"),
-                jobId=job_id,
-                stage="create_job",
-                seconds=round(time.perf_counter() - stage_t0, 3),
-                pages=meta_pages,
-            )
-
-            stage_t0 = time.perf_counter()
-            classifications = _auto_classify_internal_with_cancel(
-                job_id,
-                cancel_check=lambda: _load_batch_meta(batch_id).get("cancelRequested", False),
-                service=service,
-            )
-            counts = {c: 0 for c in CATEGORIES}
-            for value in classifications.values():
-                if value in counts:
-                    counts[value] += 1
-            _log_timing(
-                "batch_timing",
-                batchId=batch_id,
-                package=pkg.get("name"),
-                jobId=job_id,
-                stage="auto_classify",
-                seconds=round(time.perf_counter() - stage_t0, 3),
-                pages=meta_pages,
-                counts=counts,
-            )
-
-            req = ProcessRequest(classifications=classifications, keepJob=False)
-            stage_t0 = time.perf_counter()
-            download_name, zip_bytes = _process_job_bytes(job_id, req)
-            _log_timing(
-                "batch_timing",
-                batchId=batch_id,
-                package=pkg.get("name"),
-                jobId=job_id,
-                stage="process_job",
-                seconds=round(time.perf_counter() - stage_t0, 3),
-                zipBytes=len(zip_bytes),
-            )
-
-            result_filename = f"{pkg['name']}.zip"
-            result_path = os.path.join(results_dir, result_filename)
-            stage_t0 = time.perf_counter()
-            with open(result_path, "wb") as f:
-                f.write(zip_bytes)
-            _log_timing(
-                "batch_timing",
-                batchId=batch_id,
-                package=pkg.get("name"),
-                stage="write_result",
-                seconds=round(time.perf_counter() - stage_t0, 3),
-                zipBytes=len(zip_bytes),
-            )
-            
-            pkg["resultFile"] = result_filename
-            pkg["downloadName"] = download_name
+            result = _run_batch_package_worker(batch_id, pkg["name"], service)
+            pkg["jobId"] = result.get("jobId")
+            pkg["resultFile"] = result.get("resultFile")
+            pkg["downloadName"] = result.get("downloadName")
             pkg["finishedAt"] = time.time()
             pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
             pkg["status"] = "done"
+            pkg["currentStage"] = "done"
+            pkg["lastHeartbeatAt"] = time.time()
             done += 1
             _log_timing(
                 "batch_timing",
                 batchId=batch_id,
                 package=pkg.get("name"),
-                jobId=job_id,
+                jobId=pkg.get("jobId"),
                 stage="package_done",
                 seconds=round(time.perf_counter() - pkg_t0, 3),
             )
@@ -1978,12 +2142,16 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
                 pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
                 pkg["status"] = "cancelled"
                 pkg["error"] = "cancelled"
+                pkg["currentStage"] = "cancelled"
+                pkg["lastHeartbeatAt"] = time.time()
                 cancelled = True
             else:
                 pkg["finishedAt"] = time.time()
                 pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
                 pkg["status"] = "error"
                 pkg["error"] = str(e)
+                pkg["currentStage"] = "error"
+                pkg["lastHeartbeatAt"] = time.time()
                 errors += 1
         except HTTPException as e:
             pkg["finishedAt"] = time.time()
@@ -1993,12 +2161,16 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
                 pkg["error"] = e.detail.get("message")
             else:
                 pkg["error"] = str(e.detail)
+            pkg["currentStage"] = "error"
+            pkg["lastHeartbeatAt"] = time.time()
             errors += 1
         except Exception as e:
             pkg["finishedAt"] = time.time()
             pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
             pkg["status"] = "error"
             pkg["error"] = str(e)
+            pkg["currentStage"] = "error"
+            pkg["lastHeartbeatAt"] = time.time()
             errors += 1
         if pkg.get("status") == "error":
             _log_timing(
@@ -2013,19 +2185,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
 
     # Build consolidated ZIP
     stage_t0 = time.perf_counter()
-    all_path = os.path.join(results_dir, "all.zip")
-    with zipfile.ZipFile(all_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for pkg in meta.get("packages", []):
-            if pkg.get("status") != "done":
-                continue
-            result_file = pkg.get("resultFile")
-            if not result_file:
-                continue
-            file_path = os.path.join(results_dir, result_file)
-            arcname = pkg.get("downloadName") or result_file
-            zf.write(file_path, arcname=arcname)
-
-    meta["allZip"] = "all.zip"
+    all_path = _build_consolidated_batch_zip(batch_id, meta)
     _log_timing(
         "batch_timing",
         batchId=batch_id,
@@ -2053,7 +2213,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
                 blob.upload_from_filename(local_path, content_type="application/zip")
                 pkg["gcsResult"] = f"gs://{GCS_BUCKET}/{object_name}"
 
-            if os.path.exists(all_path):
+            if all_path and os.path.exists(all_path):
                 all_object = f"{result_prefix}all.zip"
                 blob = bucket.blob(all_object)
                 blob.upload_from_filename(all_path, content_type="application/zip")
@@ -2175,6 +2335,9 @@ def _build_batch_from_zip(
             "downloadName": None,
             "error": None,
             "gcsResult": None,
+            "currentStage": None,
+            "lastHeartbeatAt": None,
+            "audit": None,
         })
 
     stable_source_gcs_path = _persist_batch_source_zip(batch_id, zip_path) or source_gcs_path
@@ -2321,6 +2484,9 @@ def get_batch(batch_id: str):
                 "jobId": p.get("jobId"),
                 "downloadName": p.get("downloadName"),
                 "error": p.get("error"),
+                "currentStage": p.get("currentStage"),
+                "lastHeartbeatAt": p.get("lastHeartbeatAt"),
+                "audit": p.get("audit"),
             }
             for p in meta.get("packages", [])
         ],
@@ -2403,10 +2569,19 @@ def download_batch_all(batch_id: str):
         if bucket == GCS_BUCKET and obj:
             url = _generate_download_url(obj, "TIPIFICADO_LOTE.zip")
             return RedirectResponse(url)
+    results_dir = os.path.join(_batch_dir(batch_id), "results")
+    if not meta.get("allZip"):
+        rebuilt = _build_consolidated_batch_zip(batch_id, meta)
+        if rebuilt:
+            _save_batch_meta(batch_id, meta)
     if not meta.get("allZip"):
         raise HTTPException(status_code=404, detail="ZIP consolidado no disponible.")
-    results_dir = os.path.join(_batch_dir(batch_id), "results")
     all_path = os.path.join(results_dir, meta["allZip"])
+    if not os.path.exists(all_path):
+        rebuilt = _build_consolidated_batch_zip(batch_id, meta)
+        if rebuilt:
+            _save_batch_meta(batch_id, meta)
+            all_path = rebuilt
     if not os.path.exists(all_path):
         raise HTTPException(status_code=404, detail="ZIP consolidado no disponible.")
     return StreamingResponse(

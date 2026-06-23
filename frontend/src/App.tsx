@@ -34,6 +34,21 @@ type BatchPackage = {
   jobId?: string | null;
   downloadName?: string | null;
   error?: string | Record<string, unknown> | null;
+  currentStage?: string | null;
+  lastHeartbeatAt?: number | null;
+  audit?: { stage?: string | null; updatedAt?: number | null } | null;
+};
+
+type ProcessPayload = {
+  classifications: Record<string, Category | null>;
+  keepJob: boolean;
+  nitOverride?: string | null;
+  ocfeOverride?: string | null;
+};
+
+type BatchCreateData = {
+  batchId: string;
+  packages: number;
 };
 
 function formatElapsedSeconds(value: number | null | undefined) {
@@ -82,6 +97,11 @@ function formatBatchError(err: BatchPackage["error"]) {
   } catch {
     return "Error desconocido";
   }
+}
+
+function formatStage(stage: string | null | undefined) {
+  if (!stage) return "";
+  return stage.replace(/_/g, " ");
 }
 
 const SERVICES: {
@@ -253,7 +273,7 @@ export default function App() {
     setProcessing(true);
     setNeedOverride(null);
 
-    const payload: any = {
+    const payload: ProcessPayload = {
       classifications: Object.fromEntries(
         Array.from({ length: totalPages }, (_, i) => [String(i), cls[i] ?? null])
       ),
@@ -376,7 +396,7 @@ export default function App() {
           throw new Error(t || "No se pudo crear el lote desde GCS.");
         }
         return batchRes.json();
-      } catch (err) {
+      } catch {
         // Si la ruta GCS no esta disponible o la API no responde aqui, intentamos
         // el upload directo al endpoint /batch antes de fallar por completo.
         return null;
@@ -401,19 +421,27 @@ export default function App() {
       return res.json();
     };
 
-    let data: any = null;
+    let data: BatchCreateData | null = null;
     try {
       data = await tryGcs();
       if (!data) {
         data = await uploadBatchDirect();
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       setBatchUploading(false);
       if (err instanceof TypeError) {
         alert(getApiConnectionMessage());
+      } else if (err instanceof Error) {
+        alert(err.message || "Error subiendo lote.");
       } else {
-        alert(err?.message || "Error subiendo lote.");
+        alert("Error subiendo lote.");
       }
+      return;
+    }
+
+    if (!data) {
+      setBatchUploading(false);
+      alert("No se pudo crear el lote.");
       return;
     }
 
@@ -424,7 +452,7 @@ export default function App() {
     await refreshBatch();
   }
 
-  async function refreshBatch() {
+  const refreshBatch = React.useCallback(async () => {
     if (!batchId) return null;
     try {
       const res = await fetch(`${API_BASE}/batch/${batchId}?ts=${Date.now()}`, {
@@ -452,10 +480,10 @@ export default function App() {
         setBatchActive(false);
       }
       return status;
-    } catch (err) {
+    } catch {
       return null;
     }
-  }
+  }, [batchId]);
 
   async function retryBatchErrors() {
     if (!batchId) return;
@@ -539,7 +567,7 @@ export default function App() {
       active = false;
       if (timer) window.clearTimeout(timer);
     };
-  }, [batchId, batchActive]);
+  }, [batchId, batchActive, refreshBatch]);
 
   const typedCount = totalPages - counts.SIN;
   const progress = totalPages > 0 ? Math.round((typedCount / totalPages) * 100) : 0;
@@ -710,11 +738,13 @@ export default function App() {
                 <div className="batchList">
                   {batchPackages.map((p) => {
                     const packageElapsedLabel = getPackageElapsedLabel(p);
+                    const stageLabel = formatStage(p.currentStage || p.audit?.stage);
                     return (
                       <div key={p.name} className="batchItem">
                         <div>
                           <div className="batchName">{p.name}</div>
                           {packageElapsedLabel && <div className="small">Tiempo: {packageElapsedLabel}</div>}
+                          {p.status === "processing" && stageLabel && <div className="small">Etapa: {stageLabel}</div>}
                         </div>
                         <span className={`chip chip--status chip--${p.status}`}>{p.status}</span>
                         {p.status === "done" && (

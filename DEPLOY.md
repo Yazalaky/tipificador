@@ -25,8 +25,11 @@ El script:
 Desde la raiz:
 
 ```bash
+nvm use 20
 bash tools/deploy_frontend.sh
 ```
+
+El deploy de Firebase Hosting debe ejecutarse con Node.js 20 LTS. Con Node 22 se ha observado fallo de autenticacion en `firebase-tools` contra `https://www.googleapis.com/oauth2/v4/token` (`Premature close`).
 
 El script:
 
@@ -54,4 +57,3 @@ bash tools/deploy_backend.sh
 FIREBASE_PROJECT=tipificador-cloud \
 bash tools/deploy_frontend.sh
 ```
-
