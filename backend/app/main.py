@@ -11,12 +11,14 @@ import subprocess
 import concurrent.futures
 import threading
 import sys
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, NamedTuple, Optional, Tuple
 
 import fitz  # PyMuPDF
 import google.auth
+from google.api_core import exceptions as google_exceptions
 from google.auth.transport.requests import Request
 from google.cloud import storage
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header, Form
@@ -75,6 +77,37 @@ GCS_SIGNED_URL_EXP_SECONDS = int(os.environ.get("TIPIFICADOR_GCS_SIGNED_URL_EXP_
 GCS_SIGNER_EMAIL = os.environ.get("TIPIFICADOR_GCS_SIGNER_EMAIL", "").strip()
 CLEANUP_TOKEN = os.environ.get("TIPIFICADOR_CLEANUP_TOKEN", "").strip()
 CLEANUP_AGE_MINUTES = int(os.environ.get("TIPIFICADOR_CLEANUP_AGE_MINUTES", "30"))
+
+BATCH_META_REVISION_FIELD = "metaRevision"
+BATCH_META_SYNC_ERROR_FIELD = "metaSyncError"
+BATCH_META_GCS_RETRY_ATTEMPTS = 5
+BATCH_META_GCS_NONFINAL_ATTEMPTS = 1
+BATCH_META_GCS_RETRY_DELAY_SECONDS = 0.15
+BATCH_META_GCS_MAX_DELAY_SECONDS = 2.0
+
+_GCS_PRECONDITION_FAILED = getattr(google_exceptions, "PreconditionFailed", None)
+_GCS_TRANSIENT_EXC_TYPES = (
+    google_exceptions.ServiceUnavailable,
+    google_exceptions.GatewayTimeout,
+    google_exceptions.InternalServerError,
+    google_exceptions.DeadlineExceeded,
+)
+
+
+class BatchMetaPersistenceError(RuntimeError):
+    pass
+
+
+class BatchMetaGCSResult(NamedTuple):
+    success: bool
+    final_meta: dict
+    observed_generation: Optional[int]
+    error: Optional[Exception]
+    error_kind: Optional[str]
+
+
+class BatchMetaVerificationError(BatchMetaPersistenceError):
+    pass
 
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$", re.IGNORECASE)
 _NIT_RE = re.compile(
@@ -174,81 +207,621 @@ def _batch_meta_object_name(batch_id: str) -> str:
     return f"{_normalize_prefix(GCS_RESULTS_PREFIX)}{batch_id}/meta.json"
 
 
-def _load_batch_meta_from_gcs(batch_id: str) -> Optional[dict]:
-    if not _gcs_enabled():
+def _meta_revision(meta: Optional[dict]) -> int:
+    if not meta:
+        return 0
+    try:
+        return int(meta.get(BATCH_META_REVISION_FIELD) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+# Orden de progreso para estados de paquete. Valor mayor = más avanzado.
+_PACKAGE_STATUS_ORDER = {
+    "pending": 0,
+    "processing": 1,
+    "done": 2,
+    "error": 2,
+    "cancelled": 2,
+}
+
+
+# Orden para estados de batch. Los terminales comparten el mismo rango máximo.
+_BATCH_STATUS_ORDER = {
+    "ready": 0,
+    "pending": 1,
+    "processing": 2,
+    "cancelling": 3,
+    "partial": 4,
+    "error": 4,
+    "cancelled": 4,
+    "done": 4,
+}
+
+_BATCH_TERMINAL_STATUSES = {"done", "partial", "error", "cancelled"}
+_BATCH_NONTERMINAL_STATUSES = {"ready", "pending", "processing", "cancelling"}
+
+
+def _package_status_rank(status: Optional[str]) -> int:
+    return _PACKAGE_STATUS_ORDER.get(status, 0)
+
+
+def _batch_status_rank(status: Optional[str]) -> int:
+    return _BATCH_STATUS_ORDER.get(status, 0)
+
+
+def _is_terminal_batch_status(status: Optional[str]) -> bool:
+    return status in _BATCH_TERMINAL_STATUSES
+
+
+def _is_cancelling_batch_status(status: Optional[str]) -> bool:
+    return status == "cancelling"
+
+
+def _merge_batch_status(local_status: Optional[str], remote_status: Optional[str]) -> Optional[str]:
+    """Merge explícito de estados del batch sin perder cancelaciones ni terminales."""
+    if _is_terminal_batch_status(remote_status):
+        return remote_status
+    if _is_terminal_batch_status(local_status):
+        return local_status
+    if _is_cancelling_batch_status(local_status) or _is_cancelling_batch_status(remote_status):
+        return "cancelling"
+    if _batch_status_rank(local_status) >= _batch_status_rank(remote_status):
+        return local_status
+    return remote_status
+
+
+def _merge_batch_cancel_requested(local_meta: dict, remote_meta: dict) -> bool:
+    return bool(local_meta.get("cancelRequested", False) or remote_meta.get("cancelRequested", False))
+
+
+def _gcs_error_code(exc: Exception) -> Optional[int]:
+    """Extrae el código HTTP de una excepción de GCS, si lo tiene."""
+    code = getattr(exc, "code", None)
+    if code is None:
         return None
     try:
-        client = _gcs_client()
-        bucket = client.bucket(GCS_BUCKET)
-        blob = bucket.blob(_batch_meta_object_name(batch_id))
-        if not blob.exists():
-            return None
-        data = blob.download_as_text(encoding="utf-8")
-        meta = json.loads(data)
-        os.makedirs(_batch_dir(batch_id), exist_ok=True)
-        with open(_batch_meta_path(batch_id), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-        return meta
-    except Exception:
+        return int(code)
+    except (TypeError, ValueError):
         return None
 
 
-def _save_batch_meta_to_gcs(batch_id: str, meta: dict) -> None:
-    if not _gcs_enabled():
-        return
-    try:
-        client = _gcs_client()
-        bucket = client.bucket(GCS_BUCKET)
-        blob = bucket.blob(_batch_meta_object_name(batch_id))
-        blob.upload_from_string(
-            json.dumps(meta, ensure_ascii=False, indent=2),
-            content_type="application/json; charset=utf-8",
-        )
-    except Exception:
-        # Best-effort mirror for Cloud Run instance hopping.
-        return
+def _is_precondition_failure(exc: Exception) -> bool:
+    code = _gcs_error_code(exc)
+    if code == 412:
+        return True
+    precondition_cls = getattr(google_exceptions, "PreconditionFailed", None)
+    return bool(precondition_cls and isinstance(exc, precondition_cls))
 
 
-def _load_batch_meta(batch_id: str) -> dict:
+def _is_transient_gcs_error(exc: Exception) -> bool:
+    """Errores de GCS que vale la pena reintentar con backoff."""
+    code = _gcs_error_code(exc)
+    if code is not None:
+        # 412 es precondición fallida: se resuelve con merge, no reintento ciego.
+        if code == 412:
+            return False
+        # 5xx y 429 son transitorios.
+        if code >= 500 or code == 429:
+            return True
+    if isinstance(
+        exc,
+        (
+            google_exceptions.ServiceUnavailable,
+            google_exceptions.GatewayTimeout,
+            google_exceptions.InternalServerError,
+            google_exceptions.DeadlineExceeded,
+        ),
+    ):
+        return True
+    for linked in (getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if isinstance(linked, Exception) and _is_transient_gcs_error(linked):
+            return True
+    # Errores de red/transporte sin código explícito.
+    text = str(exc).lower()
+    if any(x in text for x in ("timeout", "timed out", "connection", "network", "temporary", "retry")):
+        return True
+    return False
+
+
+def _is_permanent_gcs_error(exc: Exception) -> bool:
+    """Errores de GCS que no mejorarán reintentando."""
+    code = _gcs_error_code(exc)
+    if code is not None:
+        # 412 no es permanente: se maneja con merge.
+        if code == 412:
+            return False
+        if 400 <= code < 500:
+            return True
+    if isinstance(
+        exc,
+        (
+            google_exceptions.Forbidden,
+            google_exceptions.Unauthorized,
+            google_exceptions.BadRequest,
+        ),
+    ):
+        return True
+    for linked in (getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if isinstance(linked, Exception) and _is_permanent_gcs_error(linked):
+            return True
+    return False
+
+
+def _merge_package(local_pkg: dict, remote_pkg: dict) -> dict:
+    """
+    Combina un paquete local con su versión remota preservando el mayor progreso.
+    Reglas:
+      - 'done' nunca pierde ante 'error' o 'cancelled'.
+      - 'error'/'cancelled' no sobrescriben 'done'.
+      - Entre estados no terminales, gana el más avanzado (processing > pending).
+      - Se preservan campos finales importantes cuando el remoto está 'done'.
+      - No se pierden nuevos campos locales que el remoto no tenga.
+    """
+    local_status = local_pkg.get("status")
+    remote_status = remote_pkg.get("status")
+    local_rank = _package_status_rank(local_status)
+    remote_rank = _package_status_rank(remote_status)
+
+    # Determinar la base ganadora.
+    if local_status == "done":
+        winner = "local"
+    elif remote_status == "done":
+        winner = "remote"
+    elif local_rank > remote_rank:
+        winner = "local"
+    elif remote_rank > local_rank:
+        winner = "remote"
+    else:
+        # Mismo rango: preferir local para conservar heartbeats más recientes,
+        # pero sin perder campos finales del remoto si éste ya terminó.
+        winner = "local"
+
+    base_pkg = dict(local_pkg) if winner == "local" else dict(remote_pkg)
+    other_pkg = remote_pkg if winner == "local" else local_pkg
+
+    # Aplicar el status ganador (puede ser el mismo).
+    if local_status == "done" or remote_status == "done":
+        base_pkg["status"] = "done"
+    elif winner == "local":
+        base_pkg["status"] = local_status
+    else:
+        base_pkg["status"] = remote_status
+
+    # Fusionar campos del otro lado sin perder información.
+    for key, value in other_pkg.items():
+        if value is None:
+            continue
+        current = base_pkg.get(key)
+        if current is None:
+            base_pkg[key] = value
+        elif key == "lastHeartbeatAt":
+            base_pkg[key] = max(current, value)
+        elif key in ("finishedAt", "elapsedSeconds") and current is not None:
+            # Conservar el valor más reciente/largo entre ambos.
+            try:
+                base_pkg[key] = max(current, value)
+            except TypeError:
+                pass
+        # Para campos finales, si el remoto está done ya se respetan abajo.
+
+    # Si el remoto está done, nunca perder sus campos finales.
+    if remote_status == "done":
+        for key in (
+            "finishedAt",
+            "elapsedSeconds",
+            "gcsResult",
+            "gcsAllZip",
+            "allZip",
+            "sourceGcsPath",
+            "jobId",
+            "resultFile",
+            "downloadName",
+        ):
+            if remote_pkg.get(key) is not None:
+                base_pkg[key] = remote_pkg[key]
+
+    return base_pkg
+
+
+def _merge_batch_meta(local_meta: dict, remote_meta: dict) -> dict:
+    """
+    Combina metadata local con remota tras un conflicto de concurrencia en GCS.
+    El resultado tiene metaRevision = max(local, remoto) + 1.
+    Garantiza que estados terminales del batch no regresen a estados iniciales.
+    """
+    if not local_meta and not remote_meta:
+        return {}
+    if not local_meta:
+        merged = deepcopy(remote_meta)
+        merged[BATCH_META_REVISION_FIELD] = _meta_revision(remote_meta) + 1
+        return merged
+    if not remote_meta:
+        merged = deepcopy(local_meta)
+        merged[BATCH_META_REVISION_FIELD] = _meta_revision(local_meta) + 1
+        return merged
+
+    merged = deepcopy(remote_meta)
+
+    # Fusionar campos de nivel batch. El remoto tiene prioridad por ser el
+    # estado confirmado en GCS, excepto que el local tenga información más
+    # reciente que el remoto no posea.
+    for key, value in local_meta.items():
+        if value is None:
+            continue
+        remote_value = remote_meta.get(key)
+        if key == "cancelRequested":
+            merged[key] = _merge_batch_cancel_requested(local_meta, remote_meta)
+        elif remote_value is None:
+            merged[key] = value
+        elif key == "lastHeartbeatAt":
+            merged[key] = max(remote_value, value)
+        elif key in ("finishedAt", "elapsedSeconds") and remote_value is not None:
+            try:
+                merged[key] = max(remote_value, value)
+            except TypeError:
+                pass
+
+    # Preservar campos finales del batch si el remoto ya terminó.
+    if remote_meta.get("status") == "done":
+        for key in ("finishedAt", "elapsedSeconds", "gcsResult", "gcsAllZip", "allZip", "sourceGcsPath"):
+            if remote_meta.get(key) is not None:
+                merged[key] = remote_meta[key]
+
+    # Fusionar paquetes por nombre.
+    local_packages = {p.get("name"): p for p in local_meta.get("packages", []) if p.get("name")}
+    remote_packages = {p.get("name"): p for p in remote_meta.get("packages", []) if p.get("name")}
+    all_names = set(local_packages) | set(remote_packages)
+    merged_packages = []
+    for name in sorted(all_names):
+        if name in local_packages and name in remote_packages:
+            merged_packages.append(_merge_package(local_packages[name], remote_packages[name]))
+        elif name in local_packages:
+            merged_packages.append(deepcopy(local_packages[name]))
+        else:
+            merged_packages.append(deepcopy(remote_packages[name]))
+    merged["packages"] = merged_packages
+
+    # Evitar regresión de estado terminal.
+    local_status = local_meta.get("status")
+    remote_status = remote_meta.get("status")
+    merged["status"] = _merge_batch_status(local_status, remote_status)
+
+    # Recalcular conteo de estado global por si el merge cambió algo.
+    done_count = sum(1 for p in merged_packages if p.get("status") == "done")
+    error_count = sum(1 for p in merged_packages if p.get("status") == "error")
+    cancelled_count = sum(1 for p in merged_packages if p.get("status") == "cancelled")
+    pending_count = sum(1 for p in merged_packages if p.get("status") in {"pending", "processing"})
+    if merged.get("status") not in _BATCH_TERMINAL_STATUSES | {"cancelling"}:
+        if pending_count:
+            merged["status"] = "processing"
+        elif error_count and done_count:
+            merged["status"] = "partial"
+        elif error_count and not done_count:
+            merged["status"] = "error"
+        elif cancelled_count and not done_count and not error_count:
+            merged["status"] = "cancelled"
+        elif done_count:
+            merged["status"] = "done"
+
+    merged[BATCH_META_REVISION_FIELD] = max(_meta_revision(local_meta), _meta_revision(remote_meta)) + 1
+    merged.pop(BATCH_META_SYNC_ERROR_FIELD, None)
+    return merged
+
+
+def _load_batch_meta_from_disk(batch_id: str) -> Optional[dict]:
     path = _batch_meta_path(batch_id)
     if not os.path.exists(path):
-        meta = _load_batch_meta_from_gcs(batch_id)
-        if meta is not None:
-            return meta
-        raise HTTPException(status_code=404, detail="Batch no existe o expiró.")
+        return None
     for _ in range(3):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except json.JSONDecodeError:
             time.sleep(0.05)
+    return None
+
+
+def _read_batch_meta_record_from_gcs(
+    batch_id: str,
+    *,
+    cache_local: bool = True,
+    strict: bool = False,
+) -> Tuple[Optional[dict], Optional[int]]:
+    if not _gcs_enabled():
+        return None, None
+    try:
+        client = _gcs_client()
+        bucket = client.bucket(GCS_BUCKET)
+        blob = bucket.blob(_batch_meta_object_name(batch_id))
+        try:
+            blob.reload()
+        except Exception as exc:
+            code = _gcs_error_code(exc)
+            if code == 404 or isinstance(exc, (FileNotFoundError, google_exceptions.NotFound)):
+                return None, None
+            if strict:
+                raise BatchMetaPersistenceError(
+                    f"No se pudo leer metadata remota del batch {batch_id}"
+                ) from exc
+            return None, None
+        generation = getattr(blob, "generation", None)
+        try:
+            generation = int(generation) if generation is not None else 0
+        except (TypeError, ValueError):
+            generation = 0
+        data = blob.download_as_text(encoding="utf-8")
+        meta = json.loads(data)
+        if cache_local:
+            os.makedirs(_batch_dir(batch_id), exist_ok=True)
+            with open(_batch_meta_path(batch_id), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        return meta, generation or None
+    except Exception as exc:
+        if strict:
+            raise BatchMetaPersistenceError(
+                f"No se pudo leer metadata remota del batch {batch_id}"
+            ) from exc
+        return None, None
+
+
+def _read_batch_meta_from_gcs(batch_id: str, *, cache_local: bool = True) -> Optional[dict]:
+    meta, _ = _read_batch_meta_record_from_gcs(batch_id, cache_local=cache_local, strict=False)
+    return meta
+
+
+def _load_batch_meta_from_gcs(batch_id: str) -> Optional[dict]:
+    return _read_batch_meta_from_gcs(batch_id, cache_local=True)
+
+
+def _save_batch_meta_to_gcs(
+    batch_id: str,
+    meta: dict,
+    *,
+    final: bool = False,
+    generation: Optional[int] = None,
+) -> BatchMetaGCSResult:
+    """Persist batch metadata to GCS using generation-based CAS.
+
+    Contract:
+      - final_meta: latest metadata after merging any remote state read during the attempt.
+      - success: whether the final merged metadata reached GCS.
+      - observed_generation: last observed object generation (None when the object is absent).
+      - error / error_kind: describe the last failure when success is False.
+
+    Failure handling:
+      - PreconditionFailed (or 412 in older/test envs): re-read remote, merge, and retry CAS.
+      - Transient Google API errors: backoff and retry.
+      - Permanent / unknown errors: fail explicitly.
+
+    On non-final failure, the caller can safely persist final_meta locally without
+    regressing to a stale pre-merge snapshot.
+    """
+    if not _gcs_enabled():
+        return BatchMetaGCSResult(True, deepcopy(meta), generation, None, None)
+
+    attempts = BATCH_META_GCS_RETRY_ATTEMPTS if final else BATCH_META_GCS_NONFINAL_ATTEMPTS
+    last_error: Optional[Exception] = None
+    error_kind: Optional[str] = None
+    working_meta = deepcopy(meta)
+    remote_meta: Optional[dict] = None
+    remote_generation = generation
+
+    if remote_generation is None:
+        for attempt in range(1, attempts + 1):
+            try:
+                remote_meta, remote_generation = _read_batch_meta_record_from_gcs(
+                    batch_id,
+                    cache_local=False,
+                    strict=True,
+                )
+                break
+            except BatchMetaPersistenceError as exc:
+                last_error = exc
+                error_kind = "read_error"
+                if _is_transient_gcs_error(exc) and attempt < attempts:
+                    logger.warning(
+                        "No se pudo leer metadata remota del batch %s desde GCS (intento %s/%s): %s",
+                        batch_id,
+                        attempt,
+                        attempts,
+                        exc,
+                    )
+                    time.sleep(min(BATCH_META_GCS_MAX_DELAY_SECONDS, BATCH_META_GCS_RETRY_DELAY_SECONDS * attempt))
+                    continue
+                if final:
+                    raise BatchMetaPersistenceError(
+                        f"No se pudo leer metadata remota del batch {batch_id} en GCS"
+                    ) from exc
+                return BatchMetaGCSResult(False, deepcopy(working_meta), remote_generation, exc, error_kind)
+
+    if remote_meta is not None:
+        working_meta = _merge_batch_meta(working_meta, remote_meta)
+    else:
+        working_meta = _merge_batch_meta(working_meta, {})
+    if remote_generation is None:
+        remote_generation = 0
+
+    client = _gcs_client()
+    bucket = client.bucket(GCS_BUCKET)
+    blob = bucket.blob(_batch_meta_object_name(batch_id))
+
+    if _GCS_PRECONDITION_FAILED is not None:
+        def _attempt_upload(payload: str, expected_generation: int) -> tuple[str, Optional[Exception]]:
+            try:
+                blob.upload_from_string(
+                    payload,
+                    content_type="application/json; charset=utf-8",
+                    if_generation_match=expected_generation or 0,
+                )
+                return "success", None
+            except _GCS_PRECONDITION_FAILED as exc:
+                return "precondition", exc
+            except _GCS_TRANSIENT_EXC_TYPES as exc:
+                return "transient", exc
+            except Exception as exc:
+                if _is_transient_gcs_error(exc):
+                    return "transient", exc
+                if _is_permanent_gcs_error(exc):
+                    return "permanent", exc
+                return "unknown", exc
+    else:
+        def _attempt_upload(payload: str, expected_generation: int) -> tuple[str, Optional[Exception]]:
+            try:
+                blob.upload_from_string(
+                    payload,
+                    content_type="application/json; charset=utf-8",
+                    if_generation_match=expected_generation or 0,
+                )
+                return "success", None
+            except _GCS_TRANSIENT_EXC_TYPES as exc:
+                return "transient", exc
+            except Exception as exc:
+                if _is_precondition_failure(exc):
+                    return "precondition", exc
+                if _is_transient_gcs_error(exc):
+                    return "transient", exc
+                if _is_permanent_gcs_error(exc):
+                    return "permanent", exc
+                return "unknown", exc
+
+    payload = json.dumps(working_meta, ensure_ascii=False, indent=2)
+    for attempt in range(1, attempts + 1):
+        status, exc = _attempt_upload(payload, remote_generation)
+        if status == "success":
+            return BatchMetaGCSResult(True, deepcopy(working_meta), remote_generation, None, None)
+
+        last_error = exc
+        error_kind = status
+
+        if status == "precondition":
+            try:
+                remote_meta, remote_generation = _read_batch_meta_record_from_gcs(
+                    batch_id,
+                    cache_local=False,
+                    strict=True,
+                )
+            except BatchMetaPersistenceError as read_exc:
+                last_error = read_exc
+                error_kind = "read_error"
+                logger.exception(
+                    "No se pudo releer metadata remota del batch %s tras un conflicto CAS",
+                    batch_id,
+                )
+                if final:
+                    raise BatchMetaPersistenceError(
+                        f"No se pudo releer metadata remota del batch {batch_id} tras un conflicto CAS"
+                    ) from read_exc
+                return BatchMetaGCSResult(False, deepcopy(working_meta), remote_generation, read_exc, error_kind)
+
+            if remote_meta is not None:
+                working_meta = _merge_batch_meta(working_meta, remote_meta)
+            else:
+                working_meta = _merge_batch_meta(working_meta, {})
+            remote_generation = remote_generation or 0
+            payload = json.dumps(working_meta, ensure_ascii=False, indent=2)
+            logger.warning(
+                "Conflicto de precondición al persistir metadata del batch %s; reintentando con la generación %s",
+                batch_id,
+                remote_generation,
+            )
+            continue
+
+        if status == "transient":
+            logger.exception(
+                "No se pudo persistir metadata del batch %s en GCS (intento %s/%s)",
+                batch_id,
+                attempt,
+                attempts,
+            )
+            if attempt < attempts:
+                time.sleep(min(BATCH_META_GCS_MAX_DELAY_SECONDS, BATCH_META_GCS_RETRY_DELAY_SECONDS * attempt))
+                continue
+            if final:
+                raise BatchMetaPersistenceError(
+                    f"No se pudo persistir la metadata final del batch {batch_id} en GCS"
+                ) from exc
+            return BatchMetaGCSResult(False, deepcopy(working_meta), remote_generation, exc, error_kind)
+
+        logger.exception(
+            "No se pudo persistir metadata del batch %s en GCS (error %s)",
+            batch_id,
+            status,
+        )
+        if final:
+            raise BatchMetaPersistenceError(
+                f"No se pudo persistir metadata del batch {batch_id} en GCS"
+            ) from exc
+        return BatchMetaGCSResult(False, deepcopy(working_meta), remote_generation, exc, error_kind)
+
+    if final:
+        raise BatchMetaPersistenceError(
+            f"No se pudo persistir la metadata final del batch {batch_id} en GCS"
+        ) from last_error
+    return BatchMetaGCSResult(False, deepcopy(working_meta), remote_generation, last_error, error_kind)
+
+
+def _load_batch_meta(batch_id: str) -> dict:
+    path = _batch_meta_path(batch_id)
+    meta = _load_batch_meta_from_disk(batch_id)
+    if meta is not None:
+        return meta
     meta = _load_batch_meta_from_gcs(batch_id)
     if meta is not None:
         return meta
-    raise HTTPException(status_code=503, detail="Batch temporalmente ocupado, intenta de nuevo.")
+    raise HTTPException(status_code=404, detail="Batch no existe o expiró.")
 
 
-def _load_batch_meta_latest(batch_id: str) -> dict:
-    if _gcs_enabled():
-        meta = _load_batch_meta_from_gcs(batch_id)
-        if meta is not None:
-            return meta
-    return _load_batch_meta(batch_id)
+def _load_batch_meta_latest(batch_id: str, *, cache_local: bool = False) -> dict:
+    local_meta = _load_batch_meta_from_disk(batch_id)
+    gcs_meta = _read_batch_meta_from_gcs(batch_id, cache_local=cache_local)
+    candidates = [meta for meta in (local_meta, gcs_meta) if meta is not None]
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Batch no existe o expiró.")
+    return max(candidates, key=_meta_revision)
 
 
-def _save_batch_meta(batch_id: str, meta: dict) -> None:
-    path = _batch_meta_path(batch_id)
+def _save_batch_meta(batch_id: str, meta: dict, *, final: bool = False, verify: bool = False) -> dict:
     os.makedirs(_batch_dir(batch_id), exist_ok=True)
+    if final:
+        verify = True
+
+    gcs_result = _save_batch_meta_to_gcs(batch_id, meta, final=final)
+    persisted = deepcopy(gcs_result.final_meta)
+
+    if not gcs_result.success and gcs_result.error is not None:
+        sync_error = f"No se pudo persistir metadata del batch {batch_id} en GCS: {gcs_result.error}"
+        persisted[BATCH_META_SYNC_ERROR_FIELD] = sync_error
+        logger.warning(sync_error)
+
+    path = _batch_meta_path(batch_id)
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+        json.dump(persisted, f, ensure_ascii=False, indent=2)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
-    _save_batch_meta_to_gcs(batch_id, meta)
+
+    if final and gcs_result.success and verify:
+        verified, _ = _read_batch_meta_record_from_gcs(batch_id, cache_local=False, strict=True)
+        if verified is None or _meta_revision(verified) != _meta_revision(persisted) or verified != persisted:
+            message = (
+                f"Verificación final de metadata falló para batch {batch_id}: "
+                f"esperaba revisión {persisted[BATCH_META_REVISION_FIELD]}"
+            )
+            logger.error(message)
+            persisted[BATCH_META_SYNC_ERROR_FIELD] = message
+            meta.clear()
+            meta.update(persisted)
+            raise BatchMetaVerificationError(message)
+
+    meta.clear()
+    meta.update(persisted)
+    return persisted
 
 
-def _live_elapsed_seconds(started_at, elapsed_seconds, status):
+def _live_elapsed_seconds(
+started_at, elapsed_seconds, status):
     if elapsed_seconds is not None and isinstance(elapsed_seconds, (int, float)):
         return elapsed_seconds
     if status in {"processing", "cancelling"} and started_at:
@@ -412,7 +985,7 @@ def _restore_batch_input_from_gcs(batch_id: str, source_gcs_path: str) -> None:
         _safe_extract_zip(zf, input_dir)
 
 
-def _reconcile_batch_meta(batch_id: str, meta: dict) -> dict:
+def _reconcile_batch_meta(batch_id: str, meta: dict, *, persist: bool = True) -> dict:
     changed = False
     stale_found = False
     now = time.time()
@@ -470,17 +1043,20 @@ def _reconcile_batch_meta(batch_id: str, meta: dict) -> dict:
         pending_count = sum(
             1 for p in meta.get("packages", []) if p.get("status") in {"pending", "processing"}
         )
-        if pending_count:
-            meta["status"] = "processing"
-        elif error_count and done_count:
-            meta["status"] = "partial"
-        elif error_count and not done_count:
-            meta["status"] = "error"
-        elif done_count:
-            meta["status"] = "done"
-        else:
-            meta["status"] = meta.get("status") or "pending"
-        _save_batch_meta(batch_id, meta)
+        current_status = meta.get("status")
+        if current_status not in _BATCH_TERMINAL_STATUSES | {"cancelling"}:
+            if pending_count:
+                meta["status"] = "processing"
+            elif error_count and done_count:
+                meta["status"] = "partial"
+            elif error_count and not done_count:
+                meta["status"] = "error"
+            elif done_count:
+                meta["status"] = "done"
+            else:
+                meta["status"] = current_status or "pending"
+        if persist:
+            _save_batch_meta(batch_id, meta)
     return meta
 
 
@@ -2250,7 +2826,22 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
         meta["status"] = "pending"
     meta["finishedAt"] = time.time()
     meta["elapsedSeconds"] = round(meta["finishedAt"] - (meta.get("startedAt") or meta["finishedAt"]), 3)
-    _save_batch_meta(batch_id, meta)
+    try:
+        meta = _save_batch_meta(batch_id, meta, final=True, verify=True)
+    except BatchMetaPersistenceError as exc:
+        meta[BATCH_META_SYNC_ERROR_FIELD] = str(exc)
+        logger.exception("Final metadata persistence failed for batch %s", batch_id)
+        _log_timing(
+            "batch_timing",
+            batchId=batch_id,
+            stage="batch_finalization_error",
+            seconds=round(time.perf_counter() - batch_t0, 3),
+            status=meta.get("status"),
+            done=done_count,
+            errors=error_count,
+            syncError=meta.get(BATCH_META_SYNC_ERROR_FIELD),
+        )
+        return
     _log_timing(
         "batch_timing",
         batchId=batch_id,
@@ -2259,6 +2850,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
         status=meta.get("status"),
         done=done_count,
         errors=error_count,
+        syncError=meta.get(BATCH_META_SYNC_ERROR_FIELD),
     )
 
 
@@ -2463,7 +3055,7 @@ def create_batch_from_gcs(req: BatchFromGCSRequest):
 
 @app.get("/batch/{batch_id}")
 def get_batch(batch_id: str):
-    meta = _reconcile_batch_meta(batch_id, _load_batch_meta_latest(batch_id))
+    meta = _reconcile_batch_meta(batch_id, _load_batch_meta_latest(batch_id, cache_local=False), persist=False)
     batch_status = meta.get("status")
     return {
         "batchId": meta.get("batchId"),
@@ -2563,26 +3155,19 @@ def cleanup_results(
 
 @app.get("/batch/{batch_id}/download/all.zip")
 def download_batch_all(batch_id: str):
-    meta = _reconcile_batch_meta(batch_id, _load_batch_meta(batch_id))
+    meta = _reconcile_batch_meta(batch_id, _load_batch_meta_latest(batch_id, cache_local=False), persist=False)
     if _gcs_enabled() and meta.get("gcsAllZip"):
         bucket, obj = _parse_gcs_path(meta["gcsAllZip"])
         if bucket == GCS_BUCKET and obj:
             url = _generate_download_url(obj, "TIPIFICADO_LOTE.zip")
             return RedirectResponse(url)
     results_dir = os.path.join(_batch_dir(batch_id), "results")
-    if not meta.get("allZip"):
+    all_path = os.path.join(results_dir, meta["allZip"]) if meta.get("allZip") else None
+    if not all_path or not os.path.exists(all_path):
         rebuilt = _build_consolidated_batch_zip(batch_id, meta)
         if rebuilt:
-            _save_batch_meta(batch_id, meta)
-    if not meta.get("allZip"):
-        raise HTTPException(status_code=404, detail="ZIP consolidado no disponible.")
-    all_path = os.path.join(results_dir, meta["allZip"])
-    if not os.path.exists(all_path):
-        rebuilt = _build_consolidated_batch_zip(batch_id, meta)
-        if rebuilt:
-            _save_batch_meta(batch_id, meta)
             all_path = rebuilt
-    if not os.path.exists(all_path):
+    if not all_path or not os.path.exists(all_path):
         raise HTTPException(status_code=404, detail="ZIP consolidado no disponible.")
     return StreamingResponse(
         open(all_path, "rb"),
@@ -2593,7 +3178,7 @@ def download_batch_all(batch_id: str):
 
 @app.get("/batch/{batch_id}/download/{package_name}.zip")
 def download_batch_package(batch_id: str, package_name: str):
-    meta = _reconcile_batch_meta(batch_id, _load_batch_meta(batch_id))
+    meta = _reconcile_batch_meta(batch_id, _load_batch_meta_latest(batch_id, cache_local=False), persist=False)
     pkg = next((p for p in meta.get("packages", []) if p.get("name") == package_name), None)
     if not pkg or pkg.get("status") != "done":
         raise HTTPException(status_code=404, detail="Paquete no disponible.")
