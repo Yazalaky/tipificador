@@ -781,6 +781,17 @@ def _load_batch_meta_latest(batch_id: str, *, cache_local: bool = False) -> dict
     return max(candidates, key=_meta_revision)
 
 
+def _persist_batch_meta_to_disk(batch_id: str, meta: dict) -> None:
+    os.makedirs(_batch_dir(batch_id), exist_ok=True)
+    path = _batch_meta_path(batch_id)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
 def _save_batch_meta(batch_id: str, meta: dict, *, final: bool = False, verify: bool = False) -> dict:
     os.makedirs(_batch_dir(batch_id), exist_ok=True)
     if final:
@@ -794,13 +805,7 @@ def _save_batch_meta(batch_id: str, meta: dict, *, final: bool = False, verify: 
         persisted[BATCH_META_SYNC_ERROR_FIELD] = sync_error
         logger.warning(sync_error)
 
-    path = _batch_meta_path(batch_id)
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(persisted, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
+    _persist_batch_meta_to_disk(batch_id, persisted)
 
     if final and gcs_result.success and verify:
         verified, _ = _read_batch_meta_record_from_gcs(batch_id, cache_local=False, strict=True)
@@ -2665,7 +2670,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
         packages=len(meta.get("packages", [])),
     )
     meta["status"] = "processing"
-    _save_batch_meta(batch_id, meta)
+    meta = _save_batch_meta(batch_id, meta)
 
     batch_dir = _batch_dir(batch_id)
     input_dir = os.path.join(batch_dir, "input")
@@ -2673,17 +2678,25 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
     os.makedirs(results_dir, exist_ok=True)
 
     target_set = set(target_names or [])
+    package_names = [pkg.get("name") for pkg in meta.get("packages", []) if pkg.get("name")]
     done = 0
     errors = 0
 
+    def _require_package(package_name: str) -> dict:
+        pkg = _find_batch_package(meta, package_name)
+        if not pkg:
+            raise RuntimeError(f"Paquete no encontrado: {package_name}")
+        return pkg
+
     cancelled = False
-    for pkg in meta.get("packages", []):
+    for package_name in package_names:
         pkg_t0 = time.perf_counter()
         if meta.get("cancelRequested"):
             cancelled = True
             break
-        if target_set and pkg.get("name") not in target_set:
+        if target_set and package_name not in target_set:
             continue
+        pkg = _require_package(package_name)
         pkg["startedAt"] = time.time()
         pkg["finishedAt"] = None
         pkg["elapsedSeconds"] = None
@@ -2692,9 +2705,10 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
         pkg["currentStage"] = "worker_start"
         pkg["lastHeartbeatAt"] = time.time()
         pkg["audit"] = {"stage": "worker_start", "updatedAt": pkg["lastHeartbeatAt"]}
-        _save_batch_meta(batch_id, meta)
+        meta = _save_batch_meta(batch_id, meta)
         try:
-            result = _run_batch_package_worker(batch_id, pkg["name"], service)
+            result = _run_batch_package_worker(batch_id, package_name, service)
+            pkg = _require_package(package_name)
             pkg["jobId"] = result.get("jobId")
             pkg["resultFile"] = result.get("resultFile")
             pkg["downloadName"] = result.get("downloadName")
@@ -2713,6 +2727,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
                 seconds=round(time.perf_counter() - pkg_t0, 3),
             )
         except RuntimeError as e:
+            pkg = _require_package(package_name)
             if str(e) == "batch_cancelled":
                 pkg["finishedAt"] = time.time()
                 pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
@@ -2730,6 +2745,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
                 pkg["lastHeartbeatAt"] = time.time()
                 errors += 1
         except HTTPException as e:
+            pkg = _require_package(package_name)
             pkg["finishedAt"] = time.time()
             pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
             pkg["status"] = "error"
@@ -2741,6 +2757,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
             pkg["lastHeartbeatAt"] = time.time()
             errors += 1
         except Exception as e:
+            pkg = _require_package(package_name)
             pkg["finishedAt"] = time.time()
             pkg["elapsedSeconds"] = round(pkg["finishedAt"] - (pkg.get("startedAt") or pkg["finishedAt"]), 3)
             pkg["status"] = "error"
@@ -2757,7 +2774,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
                 seconds=round(time.perf_counter() - pkg_t0, 3),
                 error=pkg.get("error"),
             )
-        _save_batch_meta(batch_id, meta)
+        meta = _save_batch_meta(batch_id, meta)
 
     # Build consolidated ZIP
     stage_t0 = time.perf_counter()
@@ -2775,8 +2792,9 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
             client = _gcs_client()
             bucket = client.bucket(GCS_BUCKET)
             result_prefix = f"{_normalize_prefix(GCS_RESULTS_PREFIX)}{batch_id}/"
-            for pkg in meta.get("packages", []):
-                if pkg.get("status") != "done":
+            for package_name in package_names:
+                pkg = _find_batch_package(meta, package_name)
+                if not pkg or pkg.get("status") != "done":
                     continue
                 result_file = pkg.get("resultFile")
                 if not result_file:
@@ -2830,6 +2848,7 @@ def _process_batch(batch_id: str, target_names: Optional[List[str]] = None) -> N
         meta = _save_batch_meta(batch_id, meta, final=True, verify=True)
     except BatchMetaPersistenceError as exc:
         meta[BATCH_META_SYNC_ERROR_FIELD] = str(exc)
+        _persist_batch_meta_to_disk(batch_id, meta)
         logger.exception("Final metadata persistence failed for batch %s", batch_id)
         _log_timing(
             "batch_timing",

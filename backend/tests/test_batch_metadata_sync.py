@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -420,6 +421,8 @@ def test_process_batch_emits_finalization_error_when_verification_fails(isolated
 
     assert "batch_finalization_error" in stages
     assert "batch_done" not in stages
+    disk_meta = json.loads((batch_dir / "meta.json").read_text(encoding="utf-8"))
+    assert disk_meta["metaSyncError"].startswith("Verificación final de metadata falló")
 
 
 @pytest.mark.parametrize(
@@ -649,3 +652,208 @@ def test_save_batch_meta_persists_cancelling_after_cas_conflict_retry(isolated_b
     assert disk_meta["metaRevision"] == 4
     assert "metaSyncError" not in disk_meta
     assert [attempt[1] for attempt in fake_gcs.upload_attempts[:2]] == [2, 3]
+
+
+def test_process_batch_persists_worker_results_without_stale_package_reference(isolated_batch_fs, fake_gcs, monkeypatch):
+    batch_id = "g" * 32
+    batch_dir = Path(main._batch_dir(batch_id))
+    results_dir = batch_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    _write_meta(
+        batch_dir,
+        {
+            "batchId": batch_id,
+            "service": "cuidador",
+            "status": "pending",
+            "metaRevision": 0,
+            "cancelRequested": False,
+            "packages": [
+                {
+                    "name": "P1",
+                    "folder": "P1",
+                    "status": "pending",
+                    "startedAt": None,
+                    "finishedAt": None,
+                    "elapsedSeconds": None,
+                    "jobId": None,
+                    "resultFile": None,
+                    "downloadName": None,
+                    "error": None,
+                    "gcsResult": None,
+                    "currentStage": None,
+                    "lastHeartbeatAt": None,
+                    "audit": None,
+                }
+            ],
+            "allZip": None,
+            "gcsAllZip": None,
+            "sourceGcsPath": None,
+        },
+    )
+
+    stages = []
+
+    def fake_worker(batch_id_arg, package_name, service):
+        assert batch_id_arg == batch_id
+        assert package_name == "P1"
+        assert service == "cuidador"
+        (results_dir / "P1.zip").write_text("pkg-zip", encoding="utf-8")
+        return {"jobId": "job-1", "resultFile": "P1.zip", "downloadName": "P1.zip"}
+
+    def fake_zip(batch_id_arg, meta):
+        assert batch_id_arg == batch_id
+        all_path = results_dir / "all.zip"
+        all_path.write_text("all-zip", encoding="utf-8")
+        meta["allZip"] = "all.zip"
+        return str(all_path)
+
+    def fake_log_timing(event, **fields):
+        if event == "batch_timing":
+            stages.append(fields)
+
+    monkeypatch.setattr(main, "_run_batch_package_worker", fake_worker)
+    monkeypatch.setattr(main, "_build_consolidated_batch_zip", fake_zip)
+    monkeypatch.setattr(main, "_log_timing", fake_log_timing)
+    monkeypatch.setattr(main.time, "sleep", lambda *_args, **_kwargs: None)
+
+    main._process_batch(batch_id)
+
+    local_meta = json.loads((batch_dir / "meta.json").read_text(encoding="utf-8"))
+    remote_meta = json.loads(fake_gcs.objects[main._batch_meta_object_name(batch_id)]["data"])
+    other_instance_meta = main._load_batch_meta_latest(batch_id)
+
+    assert local_meta["status"] == "done"
+    assert remote_meta["status"] == "done"
+    assert other_instance_meta["status"] == "done"
+    assert local_meta["packages"][0]["status"] == "done"
+    assert local_meta["packages"][0]["jobId"] == "job-1"
+    assert local_meta["packages"][0]["resultFile"] == "P1.zip"
+    assert local_meta["packages"][0]["downloadName"] == "P1.zip"
+    assert local_meta["packages"][0]["finishedAt"] is not None
+    assert local_meta["packages"][0]["elapsedSeconds"] is not None
+    assert local_meta["gcsAllZip"] == f"gs://{main.GCS_BUCKET}/results/{batch_id}/all.zip"
+    assert local_meta["packages"][0]["gcsResult"] == f"gs://{main.GCS_BUCKET}/results/{batch_id}/P1.zip"
+    assert remote_meta["gcsAllZip"] == f"gs://{main.GCS_BUCKET}/results/{batch_id}/all.zip"
+    assert remote_meta["packages"][0]["jobId"] == "job-1"
+    assert remote_meta["packages"][0]["resultFile"] == "P1.zip"
+    assert remote_meta["packages"][0]["downloadName"] == "P1.zip"
+    assert remote_meta["packages"][0]["finishedAt"] is not None
+    assert remote_meta["packages"][0]["elapsedSeconds"] is not None
+    assert remote_meta["packages"][0]["gcsResult"] == f"gs://{main.GCS_BUCKET}/results/{batch_id}/P1.zip"
+    assert any(name == main._batch_meta_object_name(batch_id) for name, *_ in fake_gcs.upload_attempts)
+    assert any(name == f"results/{batch_id}/P1.zip" for name, *_ in fake_gcs.upload_attempts)
+    assert any(name == f"results/{batch_id}/all.zip" for name, *_ in fake_gcs.upload_attempts)
+
+    batch_done = next(stage for stage in stages if stage.get("stage") == "batch_done")
+    assert batch_done["status"] == "done"
+    assert batch_done["done"] == 1
+    assert batch_done["errors"] == 0
+
+    shutil.rmtree(batch_dir, ignore_errors=True)
+    reopened_meta = main._load_batch_meta_latest(batch_id)
+    assert reopened_meta["status"] == "done"
+    assert reopened_meta["packages"][0]["status"] == "done"
+    assert reopened_meta["packages"][0]["jobId"] == "job-1"
+    assert reopened_meta["packages"][0]["resultFile"] == "P1.zip"
+    assert reopened_meta["packages"][0]["downloadName"] == "P1.zip"
+    assert reopened_meta["packages"][0]["finishedAt"] is not None
+    assert reopened_meta["packages"][0]["elapsedSeconds"] is not None
+
+
+@pytest.mark.parametrize(
+    ("worker_exc", "expected_status", "expected_error", "expected_stage", "expected_done", "expected_errors"),
+    [
+        (RuntimeError("boom"), "error", "boom", "error", 0, 1),
+        (RuntimeError("batch_cancelled"), "cancelled", "cancelled", "cancelled", 0, 0),
+    ],
+    ids=["worker-error", "worker-cancelled"],
+)
+def test_process_batch_reacquires_package_reference_for_error_and_cancel_paths(
+    isolated_batch_fs,
+    fake_gcs,
+    monkeypatch,
+    worker_exc,
+    expected_status,
+    expected_error,
+    expected_stage,
+    expected_done,
+    expected_errors,
+):
+    batch_id = "h" * 32
+    batch_dir = Path(main._batch_dir(batch_id))
+    results_dir = batch_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    _write_meta(
+        batch_dir,
+        {
+            "batchId": batch_id,
+            "service": "cuidador",
+            "status": "pending",
+            "metaRevision": 0,
+            "cancelRequested": False,
+            "packages": [
+                {
+                    "name": "P1",
+                    "folder": "P1",
+                    "status": "pending",
+                    "startedAt": None,
+                    "finishedAt": None,
+                    "elapsedSeconds": None,
+                    "jobId": None,
+                    "resultFile": None,
+                    "downloadName": None,
+                    "error": None,
+                    "gcsResult": None,
+                    "currentStage": None,
+                    "lastHeartbeatAt": None,
+                    "audit": None,
+                }
+            ],
+            "allZip": None,
+            "gcsAllZip": None,
+            "sourceGcsPath": None,
+        },
+    )
+
+    stages = []
+
+    def fake_worker(*_args, **_kwargs):
+        raise worker_exc
+
+    def fake_zip(batch_id_arg, meta):
+        assert batch_id_arg == batch_id
+        all_path = results_dir / "all.zip"
+        all_path.write_text("all-zip", encoding="utf-8")
+        meta["allZip"] = "all.zip"
+        return str(all_path)
+
+    def fake_log_timing(event, **fields):
+        if event == "batch_timing":
+            stages.append(fields)
+
+    monkeypatch.setattr(main, "_run_batch_package_worker", fake_worker)
+    monkeypatch.setattr(main, "_build_consolidated_batch_zip", fake_zip)
+    monkeypatch.setattr(main, "_log_timing", fake_log_timing)
+    monkeypatch.setattr(main.time, "sleep", lambda *_args, **_kwargs: None)
+
+    main._process_batch(batch_id)
+
+    local_meta = json.loads((batch_dir / "meta.json").read_text(encoding="utf-8"))
+    remote_meta = json.loads(fake_gcs.objects[main._batch_meta_object_name(batch_id)]["data"])
+
+    assert local_meta["status"] == expected_status
+    assert remote_meta["status"] == expected_status
+    assert local_meta["packages"][0]["status"] == expected_status
+    assert remote_meta["packages"][0]["status"] == expected_status
+    assert local_meta["packages"][0]["error"] == expected_error
+    assert remote_meta["packages"][0]["error"] == expected_error
+    assert local_meta["packages"][0]["currentStage"] == expected_stage
+    assert remote_meta["packages"][0]["currentStage"] == expected_stage
+    assert local_meta["gcsAllZip"] == f"gs://{main.GCS_BUCKET}/results/{batch_id}/all.zip"
+    assert remote_meta["gcsAllZip"] == f"gs://{main.GCS_BUCKET}/results/{batch_id}/all.zip"
+    assert any(name == f"results/{batch_id}/all.zip" for name, *_ in fake_gcs.upload_attempts)
+
+    batch_done = next(stage for stage in stages if stage.get("stage") == "batch_done")
+    assert batch_done["status"] == expected_status
+    assert batch_done["done"] == expected_done
+    assert batch_done["errors"] == expected_errors
