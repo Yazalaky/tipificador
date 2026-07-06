@@ -2115,6 +2115,105 @@ app.add_middleware(
 )
 
 
+@app.get("/health/live")
+def health_live():
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+def health_ready():
+    checks = {
+        "job_root_writable": False,
+        "batch_root_writable": False,
+        "tesseract_ok": False,
+        "gcs_configured": False,
+        "gcs_accessible": False,
+    }
+
+    try:
+        os.makedirs(JOB_ROOT, exist_ok=True)
+        test_file = os.path.join(JOB_ROOT, ".healthcheck")
+
+        with open(test_file, "w", encoding="utf-8") as file:
+            file.write("ok")
+
+        os.remove(test_file)
+        checks["job_root_writable"] = True
+    except Exception:
+        pass
+
+    try:
+        os.makedirs(BATCH_ROOT, exist_ok=True)
+        test_file = os.path.join(BATCH_ROOT, ".healthcheck")
+
+        with open(test_file, "w", encoding="utf-8") as file:
+            file.write("ok")
+
+        os.remove(test_file)
+        checks["batch_root_writable"] = True
+    except Exception:
+        pass
+
+    if OCR_ENABLED:
+        try:
+            result = subprocess.run(
+                ["tesseract", "--version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            checks["tesseract_ok"] = result.returncode == 0
+        except Exception:
+            pass
+    else:
+        checks["tesseract_ok"] = True
+
+    checks["gcs_configured"] = _gcs_enabled()
+
+    if checks["gcs_configured"]:
+        try:
+            client = _gcs_client()
+            bucket = client.bucket(GCS_BUCKET)
+
+            probe_name = (
+                f"{_normalize_prefix(GCS_RESULTS_PREFIX)}"
+                ".healthcheck"
+            )
+
+            # Una consulta de metadatos es suficiente para comprobar
+            # acceso sin escribir ni descargar documentos.
+            bucket.blob(probe_name).exists()
+            checks["gcs_accessible"] = True
+        except Exception:
+            checks["gcs_accessible"] = False
+
+    version = (
+        os.environ.get("TIPIFICADOR_VERSION")
+        or os.environ.get("K_REVISION")
+        or "local"
+    )
+
+    is_ready = all(checks.values())
+
+    payload = {
+        "status": "ready" if is_ready else "not_ready",
+        "version": version,
+        "storage": "ok" if checks["gcs_accessible"] else "unavailable",
+        "checks": checks,
+    }
+
+    if not is_ready:
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=503,
+            detail=payload,
+        )
+
+    return payload
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}

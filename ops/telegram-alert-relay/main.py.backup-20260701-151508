@@ -1,0 +1,122 @@
+import base64
+import html
+import json
+import logging
+import os
+
+import requests
+from flask import Flask, request
+
+app = Flask(__name__)
+
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+
+def safe(value):
+    return html.escape(str(value or "No disponible"))
+
+
+def send_telegram(text):
+    response = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=10,
+    )
+    if not response.ok:
+        try:
+            description = response.json().get(
+                "description",
+                "Sin descripción"
+            )
+        except ValueError:
+            description = response.text[:300]
+
+        raise RuntimeError(
+            f"Telegram API rechazó el mensaje: "
+            f"status={response.status_code}, "
+            f"description={description}"
+        )
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/")
+def pubsub_push():
+    envelope = request.get_json(silent=True)
+
+    if not envelope or "message" not in envelope:
+        return "Invalid Pub/Sub envelope", 400
+
+    encoded_data = envelope["message"].get("data")
+    if not encoded_data:
+        return "Missing message data", 400
+
+    try:
+        payload = json.loads(
+            base64.b64decode(encoded_data).decode("utf-8")
+        )
+
+        incident = payload.get("incident") or payload
+        state = str(incident.get("state", "UNKNOWN")).upper()
+
+        if state in {"OPEN", "ACTIVE"}:
+            icon = "🔴"
+            title = "Alerta del Tipificador"
+        elif state in {"CLOSED", "RESOLVED"}:
+            icon = "🟢"
+            title = "Tipificador recuperado"
+        else:
+            icon = "🟡"
+            title = "Evento del Tipificador"
+
+        policy = incident.get("policy_name", "Monitoreo Tipificador")
+        condition = incident.get("condition_name", "Disponibilidad")
+        resource = incident.get("resource_name", "Tipificador")
+        started = incident.get("started_at", "No disponible")
+        ended = incident.get("ended_at")
+        incident_url = incident.get("url")
+
+        lines = [
+            f"{icon} <b>{title}</b>",
+            "",
+            f"<b>Estado:</b> {safe(state)}",
+            f"<b>Política:</b> {safe(policy)}",
+            f"<b>Condición:</b> {safe(condition)}",
+            f"<b>Recurso:</b> {safe(resource)}",
+            f"<b>Inicio:</b> {safe(started)}",
+        ]
+
+        if ended:
+            lines.append(f"<b>Finalización:</b> {safe(ended)}")
+
+        if incident_url:
+            lines.extend(
+                ["", f'<a href="{safe(incident_url)}">Abrir incidente</a>']
+            )
+
+        send_telegram("\n".join(lines))
+
+        logging.info(
+            json.dumps(
+                {
+                    "event": "telegram_alert_sent",
+                    "state": state,
+                    "policy": policy,
+                }
+            )
+        )
+
+        return "", 204
+
+    except Exception:
+        logging.exception("telegram_alert_failed")
+        return "Delivery failed", 500
