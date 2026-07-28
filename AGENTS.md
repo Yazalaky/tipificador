@@ -29,3 +29,4 @@
 - Frontend deploy: set non-local `VITE_API_BASE`, then `bash tools/deploy_frontend.sh`; Firebase hosting public dir is `frontend/dist`.
 - Full deploy: `bash tools/deploy_all.sh`; it deploys backend, reads the Cloud Run URL, health-checks `/health`, then deploys frontend with that URL.
 - Maintenance mode scripts are `bash tools/maintenance_on.sh` and `bash tools/maintenance_off.sh`.
+- GitHub Actions manual deploy: `.github/workflows/manual-deploy.yml` uses `workflow_dispatch` with target `all`, `backend` or `frontend`; it authenticates via Workload Identity Federation (`vars.GCP_WORKLOAD_IDENTITY_PROVIDER`) using `vars.GCP_BACKEND_SERVICE_ACCOUNT` for the Cloud Run backend and `vars.GCP_FIREBASE_SERVICE_ACCOUNT` for Firebase Hosting; the backend job validates the Cloud Run URL before health-checking `/health`; the frontend job requires Node.js 20, `firebase-tools@15.23.0` and validates `VITE_API_BASE` for frontend-only runs.
