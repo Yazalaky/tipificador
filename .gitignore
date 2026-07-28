@@ -26,3 +26,6 @@ pnpm-debug.log*
 # Local artifacts
 *.zip
 tmp/
+
+# GitHub Actions ephemeral credentials
+gha-creds-*.json
