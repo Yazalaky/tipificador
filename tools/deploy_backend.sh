@@ -14,7 +14,7 @@ IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/api:${IMAGE_TAG}"
 
 cd "$BACKEND_DIR"
 
-gcloud builds submit --tag "$IMAGE_URI"
+gcloud builds submit --suppress-logs --tag "$IMAGE_URI"
 gcloud run deploy "$SERVICE" \
   --image "$IMAGE_URI" \
   --region "$REGION" \
