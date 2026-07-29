@@ -22,7 +22,7 @@ env:
   REGION: us-central1
   SERVICE: tipificador-api
   REPO: tipificador
-  IMAGE_TAG: prod
+  IMAGE_TAG: sha-${{ github.sha }}-run-${{ github.run_id }}-${{ github.run_attempt }}
   FIREBASE_PROJECT: tipificador-cloud
 
 concurrency:
