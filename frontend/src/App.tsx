@@ -1,4 +1,6 @@
 import React, { useMemo, useRef, useState } from "react";
+import { createBatch } from "./batchUpload";
+import type { BatchCreateData } from "./batchUpload";
 
 type Category = "CRC" | "FEV" | "HEV" | "OPF" | "PDE";
 const CATEGORIES: Category[] = ["CRC", "FEV", "HEV", "OPF", "PDE"];
@@ -44,11 +46,6 @@ type ProcessPayload = {
   keepJob: boolean;
   nitOverride?: string | null;
   ocfeOverride?: string | null;
-};
-
-type BatchCreateData = {
-  batchId: string;
-  packages: number;
 };
 
 function formatElapsedSeconds(value: number | null | undefined) {
@@ -364,69 +361,9 @@ export default function App() {
     resetBatchState();
     setBatchUploading(true);
 
-    const tryGcs = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/batch/upload-url`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ filename: file.name, service: service ?? "cuidador" }),
-        });
-        if (!res.ok) {
-          return null;
-        }
-        const data = await res.json();
-        if (!data?.uploadUrl || !data?.gcsPath) {
-          return null;
-        }
-        const putRes = await fetch(data.uploadUrl, {
-          method: "PUT",
-          headers: { "Content-Type": "application/zip" },
-          body: file,
-        });
-        if (!putRes.ok) {
-          throw new Error("No se pudo subir el ZIP a GCS.");
-        }
-        const batchRes = await fetch(`${API_BASE}/batch/from-gcs`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ gcsPath: data.gcsPath, service: service ?? "cuidador" }),
-        });
-        if (!batchRes.ok) {
-          const t = await batchRes.text();
-          throw new Error(t || "No se pudo crear el lote desde GCS.");
-        }
-        return batchRes.json();
-      } catch {
-        // Si la ruta GCS no esta disponible o la API no responde aqui, intentamos
-        // el upload directo al endpoint /batch antes de fallar por completo.
-        return null;
-      }
-    };
-
-    const uploadBatchDirect = async () => {
-      const form = new FormData();
-      form.append("file", file);
-      form.append("service", service ?? "cuidador");
-
-      const res = await fetch(`${API_BASE}/batch`, {
-        method: "POST",
-        body: form,
-      });
-
-      if (!res.ok) {
-        const t = await res.text();
-        throw new Error(t || "Error subiendo lote.");
-      }
-
-      return res.json();
-    };
-
     let data: BatchCreateData | null = null;
     try {
-      data = await tryGcs();
-      if (!data) {
-        data = await uploadBatchDirect();
-      }
+      data = await createBatch(file, service ?? "cuidador", API_BASE);
     } catch (err: unknown) {
       setBatchUploading(false);
       if (err instanceof TypeError) {
