@@ -20,6 +20,8 @@ El script:
 1. Build de imagen en Artifact Registry.
 2. Deploy de imagen a Cloud Run.
 
+El servicio se despliega con 4 vCPU y 4 GiB de memoria por instancia.
+
 ## Deploy frontend
 
 Desde la raiz:

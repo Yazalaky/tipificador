@@ -58,6 +58,8 @@ gcloud run deploy "$SERVICE" \
   --image "$IMAGE_URI" \
   --region "$REGION" \
   --platform managed \
+  --cpu 4 \
+  --memory 4Gi \
   --no-cpu-throttling \
   --update-env-vars TIPIFICADOR_OCR_WORKERS=1,TIPIFICADOR_OCR_PAGE_TIMEOUT_SECONDS=120,TIPIFICADOR_BATCH_PACKAGE_TIMEOUT_SECONDS=600,TIPIFICADOR_BATCH_STALE_SECONDS=900 \
   --allow-unauthenticated
